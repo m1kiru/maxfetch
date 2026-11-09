@@ -67,7 +67,8 @@ Run:
 ```bash
 cargo new --lib maxfetch --vcs none
 cd maxfetch
-cargo add anyhow async-trait chrono clap --features clap/derive crossterm dirs futures-util lofty ratatui serde --features serde/derive serde_json symphonia --features symphonia/all tokio --features tokio/full toml tracing tracing-subscriber --features tracing-subscriber/env-filter
+cargo add anyhow async-trait chrono clap --features clap/derive dirs futures-util lofty ratatui serde --features serde/derive serde_json symphonia --features symphonia/all tokio --features tokio/full toml tracing tracing-subscriber --features tracing-subscriber/env-filter
+cargo add crossterm --features event-stream
 cargo add reqwest --features json,stream,rustls-tls,cookies
 cargo add uuid --features v4
 cargo add rusqlite --features bundled
@@ -591,7 +592,7 @@ Expected: FAIL with "unresolved import `maxfetch::db`".
 
 - [ ] **Step 3: Implement `src/db.rs`**
 
-Use `rusqlite` with the `params![]` macro. Store `source` as the `SourceId::as_str()` string and `container` as `Container::as_str()`; convert back on read. Store `acquired_at` as an RFC 3339 UTC timestamp produced by `chrono::Utc::now().to_rfc3339()`. `duplicate_groups` selects every track with a non-null `duplicate_of`, loads the winners, and groups them by winner id; the `conflict` flag is computed as described in the Interfaces block.
+Use `rusqlite` 0.41 with the `params![]` macro from `rusqlite::params`. Open with `Connection::open(path)`, create the parent directories first, then set `PRAGMA foreign_keys=ON` with `conn.pragma_update(None, "foreign_keys", true)` and WAL with `conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))`. The WAL pragma is the one exception to `pragma_update`: `PRAGMA journal_mode=WAL` returns a row, and `pragma_update` runs the statement through `execute`, which fails with "Execute returned results" — so `query_row` is required here, and the returned mode string is ignored. Store `source` as the `SourceId::as_str()` string and `container` as `Container::as_str()`; convert back on read. Store `acquired_at` as an RFC 3339 UTC timestamp produced by `chrono::Utc::now().to_rfc3339()`. `duplicate_groups` selects every track with a non-null `duplicate_of`, loads the winners, and groups them by winner id; the `conflict` flag is computed as described in the Interfaces block.
 
 - [ ] **Step 4: Declare the module and run the test**
 
@@ -714,6 +715,13 @@ git commit -m "feat(core): library paths and filename sanitization"
   - `maxfetch::probe::ProbeResult` — `struct { container: Container, bit_depth: Option<u8>, sample_rate: Option<u32>, bitrate_kbps: Option<u32>, duration_sec: Option<f64>, channels: Option<u16> }`.
   - `maxfetch::probe::probe(path: &Path) -> anyhow::Result<ProbeResult>` — reads the container header only, never decodes audio.
 
+  Field derivation, exactly as implemented in Step 4 (fields come from `AudioCodecParameters` and the track's time base, not from a convenience accessor):
+  - `sample_rate` ← `track.codec_params.as_ref().and_then(|p| p.audio()).and_then(|a| a.sample_rate)`.
+  - `bit_depth` ← the same `AudioCodecParameters`, `bits_per_sample` (falling back to `bits_per_coded_sample` when `bits_per_sample` is `None`).
+  - `channels` ← `audio.channels.map(|c| c.count() as u16)`, because `Channels::count(&self) -> usize`.
+  - `duration_sec` ← `MediaInfo::from_track(&track).duration` (or `track.duration`, the first non-`None`), converted with the track's `time_base`. `TimeBase` is the fraction `numer/denom` (e.g. `1/44100`), so seconds are `duration.get() as f64 * time_base.numer.get() as f64 / time_base.denom.get() as f64`; `time_base.calc_duration(duration)` returns the same value as a `Time` (`seconds as f64 + frac`). There is no ready-made "seconds" accessor, so the conversion is explicit and the result is `None` when the duration or the time base is absent.
+  - `bitrate_kbps` ← derived from the file size and `duration_sec` (`size * 8 / duration_sec / 1000`), `None` when `duration_sec` is `None`.
+
 - [ ] **Step 1: Create the fixtures**
 
 Generate two FLAC files with `ffmpeg` (available on this machine) and commit them:
@@ -743,6 +751,7 @@ fn probe_reads_sample_rate_and_depth_of_flac() {
     assert_eq!(r.container, Container::Flac);
     assert_eq!(r.sample_rate, Some(44100));
     assert_eq!(r.bit_depth, Some(16));
+    assert_eq!(r.channels, Some(2));
     assert!(r.duration_sec.unwrap() > 0.9 && r.duration_sec.unwrap() < 1.1);
 }
 
@@ -766,7 +775,27 @@ Expected: FAIL with "unresolved import `maxfetch::probe`".
 
 - [ ] **Step 4: Implement `src/probe.rs`**
 
-Use `symphonia::core::io::MediaSourceStream` over a `File`, then `symphonia::core::probe::Probe::new(format_hint).with_file(&mut stream).probe()`. From the returned `FormatReader` read `format.metadata()` for the duration (in time base units) and `format.codec_params().audio` for `sample_rate`, `bits_per_sample` and `channels`. Map the format to a `Container` by inspecting the probed format type: FLAC → `Flac`, WAV → `Wav`, AIFF → `Aiff`, MP3 → `Mp3`, Ogg/Opus → `Opus`, MP4/M4A → `M4aAac`, WebM/Matroska → `Webm`. FLAC bit depth comes from the STREAMINFO block (the `bits_per_sample` of the codec parameters); when it is absent, derive it from `bits_per_coded_sample`. When the format exposes no duration, return `None` instead of guessing.
+symphonia 0.6 split its docs into per-crate modules; the umbrella crate only re-exports them. The probe API is `symphonia::default::get_probe() -> &'static Probe`, and the only entry point is:
+
+```rust
+pub fn probe<'s>(&self, hint: &Hint, mss: MediaSourceStream<'s>, fmt_opts: FormatOptions, meta_opts: MetadataOptions) -> Result<Box<dyn FormatReader + 's>>
+```
+
+There is no `Probe::format` and no `Probe::new(format_hint)`. Build the stream and the hint explicitly:
+
+```rust
+let mut hint = Hint::new();
+hint.with_extension(path.extension().and_then(|e| e.to_str()).unwrap_or(""));
+let mss = MediaSourceStream::new(Box::new(File::open(path)?), MediaSourceStreamOptions::default());
+let format = symphonia::default::get_probe()
+    .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())?;
+```
+
+From the returned `Box<dyn FormatReader>` read `format.media_info()` (`MediaInfo`, which is `#[non_exhaustive]` and carries `time_base`, `duration`, `start_ts`) and `format.default_track(TrackType::Audio)` or the first entry of `format.tracks()`. Per track use `track.codec_params` (`Option<CodecParameters>`, with `is_audio()` / `audio()` / `audio_mut()`) and the `AudioCodecParameters` struct's plain fields — `codec`, `sample_rate`, `sample_format`, `bits_per_sample`, `bits_per_coded_sample`, `channels`. There is no `AudioCodecParametersBuilder` type, and channels are counted with `Channels::count(&self) -> usize` (`Channels` is `#[non_exhaustive]`: `Positioned`, `Discrete`, `Ambisonic`, `Custom`, `None`).
+
+Duration comes from `Duration::get(self) -> u64` in the track's own time base; `TimeBase { numer, denom }` are `NonZero<u32>` and describe the fraction `numer/denom`, so seconds are `duration.get() as f64 * numer.get() as f64 / denom.get() as f64`, or equivalently `time_base.calc_duration(duration)` mapped to `Time` (`seconds as f64 + frac`). When either value is missing, `duration_sec` is `None` — never guess. Do not import `symphonia::core::formats::flac::read` or call a `read_properties` function: those do not exist. If direct FLAC access is ever needed, it is `symphonia_bundle_flac::FlacReader::try_new(mss, FormatOptions::default())`.
+
+Map the probed format to a `Container`: FLAC → `Flac`, WAV → `Wav`, AIFF → `Aiff`, MP3 → `Mp3` (`MpaReader`; `Mp3Reader` is only a deprecated alias), Ogg/Opus → `Opus`, MP4/M4A → `M4aAac`, WebM/Matroska → `Webm`. FLAC bit depth comes from the codec parameters' `bits_per_sample` (the STREAMINFO value); when it is absent, fall back to `bits_per_coded_sample`. `symphonia::default::get_codecs() -> &'static CodecRegistry` is only needed if a codec is instantiated, which header-only probing never does.
 
 - [ ] **Step 5: Declare the module and run the test**
 
@@ -797,6 +826,8 @@ git commit -m "feat(core): probe real file quality with symphonia"
   - `maxfetch::tags::write_tags(path: &Path, meta: &TagMeta) -> anyhow::Result<()>` — writes the metadata into an existing file.
   - `maxfetch::tags::lossy_comment(source: SourceId, container: Container, acquired_at: &str) -> String` — returns exactly `maxfetch: source=lossy; container=<Container::as_str()>; source_id=<SourceId::as_str()>; acquired=<acquired_at>`.
   - `maxfetch::tags::read_tags(path: &Path) -> anyhow::Result<TagMeta>` — used by `library scan` and by tests.
+
+  Tag type per container (lofty has no Matroska/WebM support at all): `TagType::VorbisComments` for `Flac`, `Opus` and Ogg/Vorbis; `TagType::Id3v2` for `Mp3`; `TagType::Mp4Ilst` for `M4aAac`; `TagType::RiffInfo` for `Wav`; `TagType::AiffText` for `Aiff`. For `Webm` there is no tag type: `write_tags` writes nothing and the file keeps only the JSON sidecar from Task 9. `Alac` inside MP4 uses `Mp4Ilst` as well.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -892,9 +923,17 @@ Expected: FAIL with "unresolved import `maxfetch::tags`".
 
 - [ ] **Step 3: Implement `src/tags.rs`**
 
-Use `lofty`. Open the file with `lofty::read_from_path`, take the existing `TaggedFile` or create a new tag for the file's `FileType`, then set the fields: title, artist, album, track number, year, and the ISRC. Write the marker into the `COMMENT` field via `ItemKey::Comment` when the file is lossy, and remove any stale `COMMENT` when it is lossless. Read back with the same API.
+Use `lofty` 0.25. Read with `lofty::read_from_path(path) -> Result<TaggedFile, FileParseError>`; that `TaggedFile` implements `TaggedFileExt`, so use `file_type() -> FileType` to choose the tag type and `tag(TagType)` / `tag_mut(TagType)` to reach the container's existing tag.
 
-`read_tags` fills `quality_comment` from the `COMMENT` tag (empty string when absent).
+Writing:
+1. Build the `Tag` for the container: `Tag::new(TagType::VorbisComments)` for FLAC/Opus/Ogg, `TagType::Id3v2` for MP3, `TagType::Mp4Ilst` for M4A/AAC/ALAC, `TagType::RiffInfo` for WAV, `TagType::AiffText` for AIFF.
+2. Insert each field with `TagItem::new(ItemKey::X, ItemValue::Text(value))` and `tag.insert(item)`, using the exact `ItemKey` names: `TrackTitle`, `TrackArtist`, `AlbumTitle`, `AlbumArtist`, `TrackNumber`, `TrackTotal`, `DiscNumber`, `Year`, `RecordingDate`, `Comment`, `Isrc`, `Genre`, `Barcode`. `track_no` goes to `TrackNumber` as a string; `year` to `Year`; `isrc` to `Isrc`.
+3. The lossy marker goes into `ItemKey::Comment` via the same `TagItem`/`ItemValue::Text` pair when `meta.quality.lossless` is false; for a lossless file call `tag.remove_key(ItemKey::Comment)` so no stale marker survives. (`TagItem::new` takes `ItemValue`; `ItemValue` is `Text`, `Locator` or `Binary` — only `Text` is used here.)
+4. Persist with `TagExt::save_to_path(path, WriteOptions::new())`, or attach the tag to the `TaggedFile` with `TaggedFileExt::insert_tag(tag)` / `tag_mut` and call `AudioFile::save_to_path(&file, path, WriteOptions::new())`. `WriteOptions::new()` is fine as-is; `respect_read_only` / `use_id3v23` / `preferred_padding` / `remove_others` are optional refinements.
+
+`read_tags` calls `lofty::read_from_path`, resolves the tag through `TaggedFileExt::tag(TagType)`, reads strings with `Tag::get_string(ItemKey::X) -> Option<&str>` (e.g. `TrackTitle`, `TrackArtist`, `AlbumTitle`, `TrackNumber`, `Year`, `Isrc`), and fills `quality_comment` from `Tag::get_string(ItemKey::Comment)` — empty string when absent. Parse `TrackNumber`/`Year` back into `u32`/`i32`.
+
+For `Container::Webm`, lofty has no Matroska/WebM reader: `write_tags` returns `Ok(())` without touching the file and `read_tags` reports an empty `quality_comment`, so the `.webm` fallback relies on the sidecar written in Task 9. Do not look for a Matroska tag type; `FileType::Custom` is the closest lofty gets and it is not written.
 
 - [ ] **Step 4: Declare the module and run the test**
 
@@ -1570,7 +1609,11 @@ Expected: FAIL with "unresolved import `maxfetch::tui`".
 
 - [ ] **Step 3: Implement the TUI**
 
-Use `ratatui` 0.30 and `crossterm` 0.29. `run` enters the alternate screen, creates the terminal with `ratatui::init()`, spawns a task reading `crossterm::event::EventStream`, renders on a tick, and restores the terminal with `ratatui::restore()` on exit.
+Use `ratatui` 0.30 and `crossterm` 0.29 with the `event-stream` feature. `run` creates the terminal with `ratatui::init() -> DefaultTerminal` (which is `Terminal<CrosstermBackend<Stdout>>` and enters the alternate screen), spawns a task reading `crossterm::event::EventStream::new()` (the `Stream<Item = io::Result<Event>>` from `crossterm::event`, requiring `event-stream`), renders on a tick, and restores the terminal with `ratatui::restore()` on exit.
+
+`render` receives `&mut ratatui::Frame` and must use `frame.area() -> Rect` (not `frame.size()`, which still exists but is the older accessor) to size the layout. Build layouts with `Layout::new(Direction::Vertical, constraints)` / `Layout::new(Direction::Horizontal, constraints)`; render lists with `List::new(items)` over `ListItem::new(text)`, tables with `Table::new(rows, widths)`, and text with `Line::raw`, `Line::styled`, `Line::spans`, `Span::raw` and `Span::styled`.
+
+`crossterm` is also reachable through `ratatui::crossterm`, so the views may import from either path; the test in Step 1 imports `crossterm::event` directly, which works because it is a direct dependency.
 
 Key bindings, exactly as in spec section 7.11: `Tab`/`Shift+Tab` change the screen, `/` focuses the search field, `Enter` expands the selected release into candidates, `Space` marks, `d` downloads the marked items, `a` downloads the best candidate of every marked release, `s` opens the settings, `?` shows the help overlay, `q` quits.
 
