@@ -33,13 +33,15 @@
 
 ## Review Focus
 
-The spec is a vision document; these inputs are implied by it but not covered by any explicit requirement. Each has a test pinned to the task that owns the relevant code, except the cases listed here, which are deliberately left to review.
+The spec is a vision document; these inputs are implied by it but not covered by any explicit requirement. Each is now pinned to a covering test in the task that owns the relevant code, and each records the decision the plan takes.
 
 1. **A peer that stalls after a few megabytes.** The failover test only feeds a transfer that fails immediately; a real stall is a silent std mpsc `Receiver<DownloadStatus>`, so the `stall_timeout_sec` path depends on `recv_timeout` firing between `InProgress` samples, not on the ranked loop. Pinned to Task 2 (`drain_transfer`).
-2. **A FLAC whose `attribs` map carries neither key 5 nor key 4.** The `bitrate == 0` case is tested with the other two attribute codes present; a release where all three are absent lands in the "unknown quality" class and must still rank below every known FLAC, not above it. Pinned to Task 1 (`quality_from_attributes`).
-3. **A YouTube title that is not a track title** — `"Artist - Topic"`, a 3-hour DJ set, a video with no `track` field and an `uploader` that is a radio station. The fallback test only covers a clean `uploader`/`title` pair, so the library path this lands on is unverified. Pinned to Task 3 (`parse_video`).
-4. **The Spotify token endpoint answering 200 with `{"error":"invalid_client"}` in the body.** The mapping test only covers a body that lacks `access_token`; a credential-shaped error body must surface as "ключи Spotify отклонены", never as a raw response dump. Pinned to Task 5 (`parse_token_response`).
-5. **A WebM whose audio stream is not Opus** (an AAC `m4a` fetched under a `.webm` name, or a remux that exits non-zero on an unusual codec). The remux test only uses an Opus stream, so the rule "the extension follows the actual codec, and a failed remux leaves `.webm` plus a sidecar" is unproven. Pinned to Task 4 (`finalize`).
+2. **A FLAC whose `attribs` map carries none of keys 0, 4 and 5.** Tested by `a_flac_without_bitrate_rate_and_depth_ranks_below_a_known_flac`: such a release lands in the "unknown quality" class and must rank below a FLAC with a known depth or rate, never above it. Decision: never invent a value; the entry keeps every numeric field `None` and `compare_quality` puts it last. Pinned to Task 1 (`quality_from_attributes`).
+3. **A YouTube title that is not a track title** — `"Artist - Topic"`, a 3-hour DJ set, a video with no `track` field and an `uploader` that is a radio station. Decisions: (a) a `- Topic` channel is a loader, so the suffix is stripped and `Topic` never survives as an artist name; (b) anything longer than `MAX_TRACK_SECONDS` (900 s) is a DJ set or a radio broadcast and is rejected by `parse_video` with an error naming the duration; (c) a radio-station uploader with no `track` field is used verbatim as the artist, with the video title as the title and no album, because guessing a split out of a station name would invent data. Three tests pin all three cases. Pinned to Task 3 (`parse_video`).
+4. **The Spotify token endpoint answering 200 with `{"error":"invalid_client"}` in the body.** The mapping test only covers a body that lacks `access_token`; a credential-shaped error body must surface as "ключи Spotify отклонены", never as a raw response dump. The covering test asserts exactly that string (equivalently `AuthState::Expired` on the source). Pinned to Task 5 (`parse_token_response`).
+5. **A WebM whose audio stream is not Opus** (an AAC `m4a` fetched under a `.webm` name, or a remux that exits non-zero on an unusual codec). Two tests cover it: one feeds an AAC stream under a `.webm` name and asserts the probe-derived container is the real codec while the file keeps `.webm`, gets no tags, gets a sidecar and the `UNTAGGED` badge; one keeps `ffmpeg` present but makes the remux fail and asserts the same fallback with no panic. Pinned to Task 4 (`finalize`).
+6. **Resuming an interrupted transfer from an offset.** The Soulseek protocol as exposed by `soulseek_rs` 20.0.0 has no offset resume. Decision: an unfinished download is deleted and restarted from zero; a transfer never leaves a `.part` file behind and never appends to one. Pinned to Task 2 (`Transfer::fetch`, `download_ranked`).
+7. **Peer availability in the Downloads screen.** A peer with no free slots is dropped before ranking, but a transfer already running against a peer that fills up must still be visible as unusable. Decision: the Downloads screen shows the peer name, its free slots and the transfer speed for every active transfer, and marks the peer as unavailable when `slots == 0`. Pinned to Task 8.
 
 ---
 
@@ -52,10 +54,10 @@ The spec is a vision document; these inputs are implied by it but not covered by
 - Test: `tests/soulseek_selection.rs`
 
 **Interfaces:**
-- Consumes: `maxfetch::model::{Candidate, Container, Locator, Quality, Release}`, `maxfetch::quality::compare_quality` (core Tasks 1).
+- Consumes: `maxfetch::model::{Candidate, Container, Locator, Quality, Release}`, `maxfetch::quality::compare_quality` (core Tasks 1). Core Task 1 already gives `Quality`, `Container`, `Release`, `Locator` and `Candidate` the derives `Clone + Debug + PartialEq`; that is what makes the `assert_eq!` comparisons in the tests below legal, and this task adds no derives of its own.
 - Produces:
   - `maxfetch::sources::soulseek::PeerCandidate` — `struct { username: String, filename: String, size: u64, slots: u8, speed: u32, quality: Quality }`, `Clone + Debug + PartialEq`. `slots` and `speed` keep the crate's own widths (`SearchResult::{slots, speed}`); `filename` is copied from `soulseek_rs::File::name`.
-  - `maxfetch::sources::soulseek::ATTR_BITRATE/ATTR_DURATION/ATTR_VBR/ATTR_SAMPLE_RATE/ATTR_BIT_DEPTH` — `const ...: u32 = 0 / 1 / 2 / 4 / 5`, matching the codes the crate writes into `File::attribs`.
+  - `maxfetch::sources::soulseek::ATTR_BITRATE/ATTR_DURATION/ATTR_SAMPLE_RATE/ATTR_BIT_DEPTH` — `const ...: u32 = 0 / 1 / 4 / 5`, matching the codes the spec fixes in section 8.1 and the crate writes into `File::attribs`. There is no VBR code in the contract.
   - `maxfetch::sources::soulseek::attrib(attribs: &std::collections::HashMap<u32, u32>, code: u32) -> Option<u32>` — the raw lookup; `None` when the code is absent.
   - `maxfetch::sources::soulseek::lossless_extension(ext: &str) -> bool` — lowercase extension without the leading dot; true for `flac`, `wav`, `alac`, `aiff`, `ape`, `wv`.
   - `maxfetch::sources::soulseek::quality_from_attributes(name: &str, attribs: &std::collections::HashMap<u32, u32>) -> Option<Quality>` — the parameter is exactly `&HashMap<u32, u32>` taken from `File::attribs`; `None` when the extension has no `Container` mapping; `bitrate_kbps` is `None` for every lossless container and equals `attribs[ATTR_BITRATE]` (when it is above zero) for lossy ones.
@@ -72,7 +74,7 @@ use std::collections::HashMap;
 use maxfetch::model::{Container, Quality, Release, SourceId};
 use maxfetch::sources::soulseek::{
     attrib, describe_peer, into_candidate, lossless_extension, peer_from_file, quality_from_attributes,
-    rank_peers, PeerCandidate, ATTR_BITRATE, ATTR_BIT_DEPTH, ATTR_SAMPLE_RATE,
+    rank_peers, PeerCandidate, ATTR_BITRATE, ATTR_BIT_DEPTH, ATTR_DURATION, ATTR_SAMPLE_RATE,
 };
 
 fn peer(user: &str, slots: u8, speed: u32, quality: Quality, size: u64) -> PeerCandidate {
@@ -195,6 +197,19 @@ fn a_file_the_library_cannot_lay_out_becomes_no_peer() {
 }
 
 #[test]
+fn a_flac_without_bitrate_rate_and_depth_ranks_below_a_known_flac() {
+    let unknown = quality_from_attributes("unknown.flac", &HashMap::from([(ATTR_DURATION, 240)])).unwrap();
+    assert_eq!(unknown.bit_depth, None);
+    assert_eq!(unknown.sample_rate, None);
+    assert_eq!(unknown.bitrate_kbps, None);
+    let ranked = rank_peers(&[
+        peer("unknown", 9, 4, unknown, 900),
+        peer("known", 1, 1, flac(16, 44100), 100),
+    ]);
+    assert_eq!(ranked[0].username, "known");
+}
+
+#[test]
 fn describe_peer_names_the_slots_and_the_speed() {
     assert_eq!(describe_peer(&peer("alice", 2, 4, flac(16, 44100), 1)), "пир alice: скорость 4, слотов 2");
 }
@@ -228,7 +243,7 @@ Expected: FAIL with "unresolved import `maxfetch::sources::soulseek`".
 
 Add the dependency first: `cargo add soulseek-rs-lib@20.0.0`. The crate is imported as `use soulseek_rs::{Client, DownloadStatus, File, SearchResult};`. There is no typed attribute enum and no public response wrapper in this version: attribute data arrives only as `File::attribs: HashMap<u32, u32>`, keyed by the numeric codes the protocol uses, and `File` exposes `name: String`, `size: u64` and `attribs`.
 
-`quality_from_attributes` takes the extension of `name` lowercased and without the leading dot, maps it through `Container::from_ext`, and returns `None` when that mapping is missing even if `lossless_extension` is true (the `Container` enum has no `Ape`/`Wv` variant, so those files cannot be laid out in the library and are skipped at selection time). Bit depth and sample rate come from `attrib(attribs, ATTR_BIT_DEPTH)` and `attrib(attribs, ATTR_SAMPLE_RATE)`; the bitrate comes from `attrib(attribs, ATTR_BITRATE)` and is kept only when the container is lossy and the value is above zero. `ATTR_DURATION` and `ATTR_VBR` are declared for completeness and are ignored by this function.
+`quality_from_attributes` takes the extension of `name` lowercased and without the leading dot, maps it through `Container::from_ext`, and returns `None` when that mapping is missing even if `lossless_extension` is true (the `Container` enum has no `Ape`/`Wv` variant, so those files cannot be laid out in the library and are skipped at selection time). Bit depth and sample rate come from `attrib(attribs, ATTR_BIT_DEPTH)` and `attrib(attribs, ATTR_SAMPLE_RATE)`; the bitrate comes from `attrib(attribs, ATTR_BITRATE)` and is kept only when the container is lossy and the value is above zero. `ATTR_DURATION` is declared for completeness and is ignored by this function; the attribute codes follow spec section 8.1 exactly (`0` bitrate, `1` length, `4` sample rate, `5` bit depth) and there is no VBR code. A FLAC whose map carries none of `0`, `4` and `5` therefore yields a `Quality` with every numeric field `None`; `compare_quality` keeps such an unknown-quality entry below every FLAC with a known depth or rate.
 
 `peer_from_file` builds `PeerCandidate { username, filename, size, slots, speed, quality }` from a `SearchResult`'s `username`, `slots`, `speed` and one of its `files`, returning `None` when the derived quality is `None`.
 
@@ -239,7 +254,7 @@ Add the dependency first: `cargo add soulseek-rs-lib@20.0.0`. The crate is impor
 Add `pub mod soulseek;` to `src/sources/mod.rs`.
 
 Run: `cargo test --test soulseek_selection`
-Expected: PASS, 14 tests.
+Expected: PASS, 15 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -258,9 +273,10 @@ git commit --author="m1kiru <m1kiru@github.com>" -m "feat(soulseek): peer model,
 
 **Interfaces:**
 - Consumes: `PeerCandidate`, `rank_peers`, `quality_from_attributes`, `peer_from_file`, `into_candidate` (Task 1); `maxfetch::fetch::ProgressSink`; `maxfetch::config::{DownloadConfig, SoulseekCredentials}` (core Tasks 3, 8); `maxfetch::sources::{AuthState, Capabilities, Source}` (core Task 10).
+- **Verified crate API (source of truth for this task):** `soulseek_rs` 20.0.0 exposes `Client::new(username, password) -> Client`, `Client::connect(&mut self) -> Result<()>` and `Client::login(&self) -> Result<bool>`. This plan follows that crate API; spec section 8.1 still describes the older `Client::new` → `connect` → `login(user, pass)` shape and will be aligned to the crate by a separate edit that does not touch this file.
 - Produces:
   - `maxfetch::sources::soulseek::drain_transfer(events: std::sync::mpsc::Receiver<soulseek_rs::DownloadStatus>, stall_timeout: std::time::Duration, sink: &dyn ProgressSink) -> anyhow::Result<u64>` — a blocking `recv()`/`recv_timeout()` loop over the std mpsc receiver the crate hands out. `DownloadStatus::InProgress { bytes_downloaded, total_bytes, speed_bytes_per_sec }` is the only progress sample: it is forwarded to `sink` (so the TUI gets speed and ETA through the sink and never polls the crate) and remembered; `is_terminal()` ends the loop — `Completed` calls `sink.on_finished` and returns the last `total_bytes`, `Failed(Some(msg))` returns that message, `Failed(None)` returns `"transfer failed"`, `Cancelled` returns `"transfer cancelled"`, `TimedOut` returns `"transfer timed out"`. `Err(RecvTimeoutError::Timeout)` returns `"transfer stalled after <n>s"` and `Err(RecvTimeoutError::Disconnected)` without a terminal status returns `"peer disconnected"`. `Queued` and `Paused { .. }` keep waiting.
-  - `maxfetch::sources::soulseek::Transfer` — `trait { fn fetch(&self, peer: &PeerCandidate, dest: &Path, sink: &dyn ProgressSink) -> anyhow::Result<u64> }`, `Send + Sync`. The implementation writes the complete file at `dest` and returns the byte count; it owns the blocking download and the `drain_transfer` call.
+  - `maxfetch::sources::soulseek::Transfer` — `trait { fn fetch(&self, peer: &PeerCandidate, dest: &Path, sink: &dyn ProgressSink) -> anyhow::Result<u64> }`, `Send + Sync`. The implementation writes the complete file at `dest` and returns the byte count; it owns the blocking download and the `drain_transfer` call. The Soulseek protocol as exposed by `soulseek_rs` has no offset resume, so `fetch` deletes any partial file left at `dest` before it starts: an interrupted transfer always restarts from zero. The trait makes that a requirement on every implementation, the tests' fakes included.
   - `maxfetch::sources::soulseek::download_ranked(transfer: &dyn Transfer, ranked: &[PeerCandidate], dest: &Path, sink: &dyn ProgressSink) -> anyhow::Result<PeerCandidate>` — for each peer in order, fetches into `dest.with_extension("part")` and renames to `dest` on success; on any `TimedOut`/`Failed`/stall/cancel error it removes the `.part` file, logs the peer with `tracing::warn!` and falls over to the next peer. Returns the peer that delivered the file; returns `Err` only when the list is empty or every peer failed.
   - `maxfetch::sources::soulseek::release_from_filename(filename: &str) -> (Option<String>, String)` — splits `"Artist - Title.flac"` into artist and title (title keeps no extension, artist is `None` when the stem has no ` - `).
   - `maxfetch::sources::soulseek::SoulseekSource` — `struct` with `SoulseekSource::new(credentials: SoulseekCredentials, download: DownloadConfig) -> SoulseekSource` (never touches the network, never constructs a `Client`), plus `pub fn peers(&self) -> Vec<PeerCandidate>`.
@@ -373,6 +389,25 @@ fn every_peer_failing_is_an_error_with_the_partial_file_removed() {
     assert!(!dest.exists());
 }
 
+struct HalfWriter;
+
+impl Transfer for HalfWriter {
+    fn fetch(&self, peer: &PeerCandidate, dest: &Path, _sink: &dyn maxfetch::fetch::ProgressSink) -> anyhow::Result<u64> {
+        std::fs::write(dest, vec![0u8; 4096])?;
+        anyhow::bail!("peer {} dropped after 4096 bytes", peer.username)
+    }
+}
+
+#[test]
+fn an_interrupted_transfer_leaves_no_partial_file_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("track.flac");
+    let err = download_ranked(&HalfWriter, &[peer("half")], &dest, &NoopSink).unwrap_err();
+    assert!(format!("{err}").contains("4096"));
+    assert!(!dir.path().join("track.part").exists());
+    assert!(!dest.exists());
+}
+
 #[test]
 fn an_empty_peer_list_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
@@ -415,7 +450,7 @@ Expected: FAIL with "unresolved import `download_ranked`".
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test --test soulseek_client`
-Expected: PASS, 9 tests.
+Expected: PASS, 11 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -440,8 +475,9 @@ git commit --author="m1kiru <m1kiru@github.com>" -m "feat(soulseek): blocking cl
 - Produces:
   - `maxfetch::youtube::YoutubeVideo` — `struct { video_id: String, title: String, duration_sec: Option<f64>, url: String }`, `Clone + Debug + PartialEq`.
   - `maxfetch::youtube::YoutubeTrackMeta` — `struct { title: String, artist: String, album: Option<String> }`, `Clone + Debug + PartialEq`.
+  - `maxfetch::youtube::MAX_TRACK_SECONDS` — `const ...: u64 = 900`. Anything longer is a DJ set or a radio broadcast, not a track.
   - `maxfetch::youtube::parse_flat_playlist(json: &serde_json::Value) -> anyhow::Result<Vec<YoutubeVideo>>` — reads `entries[]` (`id`, `title`, `duration`), skips entries without an `id`, and builds `url` as `https://www.youtube.com/watch?v=<id>`.
-  - `maxfetch::youtube::parse_video(json: &serde_json::Value) -> anyhow::Result<YoutubeTrackMeta>` — `title` from `track` when present, else from `title`; `artist` from `artist` when present, else from `uploader`, else from `channel`; `album` from `album`.
+  - `maxfetch::youtube::parse_video(json: &serde_json::Value) -> anyhow::Result<YoutubeTrackMeta>` — `title` from `track` when present, else from `title`; `artist` from `artist` when present, else from `uploader`, else from `channel`, with a trailing ` - Topic` stripped (a `- Topic` channel is the label's loader, so its `Topic` suffix is never an artist name and `Topic` alone is never returned); `album` from `album`. An error when the duration exceeds `MAX_TRACK_SECONDS` (`"слишком длинное видео (<n> с): DJ-сет или радиопередача"`), and a fallback to `"Unknown Artist"` when the stripped artist would be empty.
   - `maxfetch::youtube::bestaudio_quality(json: &serde_json::Value) -> Quality` — picks the `formats[]` entry with the highest `abr`, maps `asr` to `sample_rate` and `abr` to `bitrate_kbps` (rounded), and always returns `lossless: false, container: Container::Opus` when the winning entry's `acodec` is `opus`, `Container::M4aAac` otherwise.
   - `maxfetch::youtube::run_json(yt_dlp_path: &str, args: &[&str]) -> anyhow::Result<serde_json::Value>` — runs the binary and parses stdout; a spawn failure becomes `anyhow::Error` mentioning `yt-dlp`.
   - `maxfetch::youtube::binary_status(path: &str) -> Option<String>` — `None` when `<path> --version` exits 0, otherwise `Some("yt-dlp не найден: <path>")`.
@@ -516,6 +552,31 @@ fn a_video_without_track_fields_falls_back_to_the_uploader() {
 }
 
 #[test]
+fn a_topic_channel_is_a_loader_not_an_artist() {
+    let json: serde_json::Value = serde_json::from_str(r#"{"title":"Get Lucky","channel":"Daft Punk - Topic","uploader":"Daft Punk - Topic","duration":369}"#).unwrap();
+    let meta = parse_video(&json).unwrap();
+    assert_eq!(meta.artist, "Daft Punk");
+    assert!(!meta.artist.contains("Topic"));
+}
+
+#[test]
+fn a_three_hour_dj_set_is_rejected() {
+    let json: serde_json::Value = serde_json::from_str(r#"{"title":"Boiler Room Set","channel":"Some DJ","duration":10800}"#).unwrap();
+    let err = parse_video(&json).unwrap_err();
+    assert!(format!("{err}").contains("DJ"));
+    assert_eq!(maxfetch::youtube::MAX_TRACK_SECONDS, 900);
+}
+
+#[test]
+fn a_radio_station_uploader_becomes_the_artist_without_inventing_data() {
+    let json: serde_json::Value = serde_json::from_str(r#"{"title":"Midnight Hour","uploader":"Radio Nimbus","duration":210}"#).unwrap();
+    let meta = parse_video(&json).unwrap();
+    assert_eq!(meta.title, "Midnight Hour");
+    assert_eq!(meta.artist, "Radio Nimbus");
+    assert_eq!(meta.album, None);
+}
+
+#[test]
 fn bestaudio_is_opus_at_160_kbps_and_is_lossy() {
     let q = bestaudio_quality(&fixture_json("video.json"));
     assert!(!q.lossless);
@@ -553,14 +614,14 @@ Expected: FAIL with "unresolved import `maxfetch::youtube`".
 
 - [ ] **Step 3: Implement `src/youtube.rs`**
 
-`run_json` spawns `std::process::Command::new(yt_dlp_path).args(args).output()`, propagates a spawn error as `anyhow::Error` whose message names `yt-dlp`, fails on a non-zero exit including the tail of stderr, and parses stdout with `serde_json::from_slice`. `binary_status` runs `Command::new(path).arg("--version")` and returns the Russian message on a spawn error or a non-zero status. `bestaudio_quality` iterates `formats`, ignores entries without `abr`, keeps the highest, and reads `asr`/`abr` as `f64` then converts. `parse_video` reads the string fields defensively: a missing `track` falls back to `title`, a missing `artist` to `uploader` then `channel`; a missing title is an error mentioning the video id when present.
+`run_json` spawns `std::process::Command::new(yt_dlp_path).args(args).output()`, propagates a spawn error as `anyhow::Error` whose message names `yt-dlp`, fails on a non-zero exit including the tail of stderr, and parses stdout with `serde_json::from_slice`. `binary_status` runs `Command::new(path).arg("--version")` and returns the Russian message on a spawn error or a non-zero status. `bestaudio_quality` iterates `formats`, ignores entries without `abr`, keeps the highest, and reads `asr`/`abr` as `f64` then converts. `parse_video` reads the string fields defensively: a missing `track` falls back to `title`, a missing `artist` to `uploader` then `channel`; a trailing ` - Topic` (case-insensitive) is stripped from whichever artist source won, and `Topic` alone falls through to `"Unknown Artist"`; a missing title is an error mentioning the video id when present. A `duration` above `MAX_TRACK_SECONDS` (900) is an error naming the video as a DJ set or radio broadcast; a missing `duration` is not a rejection, it just leaves the length unknown.
 
 - [ ] **Step 4: Declare the module and run the test**
 
 Add `pub mod youtube;` to `src/lib.rs`.
 
 Run: `cargo test --test youtube_parse`
-Expected: PASS, 7 tests.
+Expected: PASS, 10 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -582,12 +643,13 @@ git commit --author="m1kiru <m1kiru@github.com>" -m "feat(youtube): yt-dlp json 
 **Interfaces:**
 - Consumes: `maxfetch::media::{remux_to_opus, write_sidecar}` (core Task 9); `maxfetch::probe::probe` (core Task 6); `maxfetch::fetch::ProgressSink`; `YoutubeTrackMeta`, `parse_video`, `parse_flat_playlist`, `run_json`, `bestaudio_quality` (Task 3); `maxfetch::sources::{Capabilities, Source}` (core Task 10); `maxfetch::config::YoutubeConfig`, `MediaConfig` (core Task 3).
 - Produces:
-  - `maxfetch::youtube::FinalizedAudio` — `struct { path: PathBuf, container: Container, remuxed: bool, sidecar: Option<PathBuf> }`.
+  - `maxfetch::youtube::FinalizedAudio` — `struct { path: PathBuf, container: Container, untagged: bool, sidecar: Option<PathBuf> }`. `container` is always the container `maxfetch::probe::probe` reports for the finished file, never a guess from the path. `untagged` is true exactly on the fallback path (`.webm` bytes plus a sidecar JSON plus the `UNTAGGED` badge) and false when the remux produced a tagged `.opus`.
   - `maxfetch::youtube::download_audio(yt_dlp_path: &str, video_id: &str, url: &str, work_dir: &Path, sink: &dyn ProgressSink) -> anyhow::Result<PathBuf>` — runs `yt-dlp -f bestaudio -o <work_dir>/<video_id>.%(ext)s <url>` and returns the single file created in `work_dir`.
-  - `maxfetch::youtube::finalize(ffmpeg_path: &str, downloaded: &Path, dest: &Path, video_id: &str, meta: &YoutubeTrackMeta) -> anyhow::Result<FinalizedAudio>` — remuxes to `dest` with `maxfetch::media::remux_to_opus`; on success `container` is `Opus` and `sidecar` is `None`. On a remux failure the downloaded bytes are copied to `dest` and `sidecar_payload` is written to `<dest>.json` through `write_sidecar`; `container` is then `Webm`.
+  - `maxfetch::youtube::finalize(ffmpeg_path: &str, downloaded: &Path, dest: &Path, video_id: &str, meta: &YoutubeTrackMeta) -> anyhow::Result<FinalizedAudio>` — remuxes to `dest` with `maxfetch::media::remux_to_opus`; on success `untagged` is `false` and `sidecar` is `None`. On a remux failure the downloaded bytes are copied to `dest` and `sidecar_payload` is written to `<dest>.json` through `write_sidecar`; `untagged` is then `true`. In both branches `container` comes from `probe(dest)`: an AAC stream delivered under a `.webm` name reports its real container, not `Webm`, and never `Opus`.
   - `maxfetch::youtube::sidecar_payload(video_id: &str, meta: &YoutubeTrackMeta) -> serde_json::Value` — keys `source` (`"youtube"`), `video_id`, `title`, `artist`, `album`.
   - `maxfetch::youtube::untagged(path: &Path) -> bool` — true when `path` exists and `<path>.json` exists next to it.
   - `maxfetch::youtube::move_sidecar(temp_media: &Path, final_media: &Path) -> anyhow::Result<Option<PathBuf>>` — renames `<temp_media>.json` to `<final_media>.json` and returns the new path, or `None` when there is no sidecar to move.
+  - `maxfetch::sources::youtube::split_artist_title(filename: &str) -> Option<(String, String)>` — the one splitter this task uses. Input is a file name of the shape `<artist> - <title>.<ext>`; the stem is taken first, then split on the first ` - ` separator (case-insensitive ` - ` with optional surrounding spaces is not required: the separator is the literal ` - `). `Some((artist, title))` with both sides trimmed and non-empty when a separator exists; `None` when the stem has no ` - ` or either side would be empty. This replaces every "`release_from_filename`-style splitting" reference in this task; `soulseek::release_from_filename` stays a Soulseek-only helper with its own fallback contract.
   - `maxfetch::sources::youtube::YoutubeSource` — `struct` with `new(config: &YoutubeConfig, media: &MediaConfig) -> YoutubeSource`; `impl Source` with `id` → `SourceId::Youtube`, `capabilities` → `Capabilities { audio: true, metadata_only: false, lossless: false, needs_auth: false }`, `auth_state` → `AuthState::NotNeeded`, `search` → one `Release` per playlist entry or the single video, `resolve` → the same for a playlist URL, `candidates` → one `Candidate` with the `bestaudio_quality` result and `Locator::Youtube { url, video_id }`, `download` → `download_audio` then `finalize` into `dest`.
 
 - [ ] **Step 1: Write the failing test**
@@ -596,6 +658,7 @@ Create `tests/youtube_audio.rs`:
 ```rust
 use std::path::PathBuf;
 use maxfetch::model::Container;
+use maxfetch::sources::youtube::split_artist_title;
 use maxfetch::youtube::{finalize, move_sidecar, sidecar_payload, untagged, YoutubeTrackMeta};
 
 fn fixture_flac() -> PathBuf {
@@ -623,12 +686,61 @@ fn a_remuxed_youtube_file_is_opus_and_carries_no_sidecar() {
     let src = webm_fixture(dir.path());
     let dest = dir.path().join("out.bin");
     let done = finalize("ffmpeg", &src, &dest, "abc123", &meta()).unwrap();
-    assert!(done.remuxed);
+    assert!(!done.untagged);
     assert_eq!(done.container, Container::Opus);
     assert!(done.sidecar.is_none());
     assert!(!untagged(&dest));
     let probed = maxfetch::probe::probe(&dest).unwrap();
     assert_eq!(probed.container, Container::Opus);
+}
+
+/// AAC bytes under a `.webm` name: `ffmpeg` cannot mux AAC into a real WebM, so
+/// the m4a is produced first and then renamed to the misleading extension.
+fn aac_fixture(dir: &std::path::Path) -> PathBuf {
+    let m4a = dir.join("aac.m4a");
+    let status = std::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-y", "-i"]).arg(fixture_flac())
+        .args(["-vn", "-c:a", "aac", "-b:a", "128k"]).arg(&m4a)
+        .status().unwrap();
+    assert!(status.success());
+    let out = dir.join("abc123.webm");
+    std::fs::rename(&m4a, &out).unwrap();
+    out
+}
+
+#[test]
+fn an_aac_stream_under_a_webm_name_reports_its_real_container() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = aac_fixture(dir.path());
+    let dest = dir.path().join("out.webm");
+    let done = finalize("ffmpeg", &src, &dest, "abc123", &meta()).unwrap();
+    assert!(done.untagged);
+    assert_eq!(done.container, Container::M4aAac);
+    assert_ne!(done.container, Container::Webm);
+    assert_ne!(done.container, Container::Opus);
+    assert_eq!(dest.extension().and_then(|e| e.to_str()), Some("webm"));
+    assert!(done.sidecar.is_some());
+    assert!(untagged(&dest));
+}
+
+#[test]
+fn a_remux_failing_on_an_unusual_input_falls_back_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("abc123.webm");
+    std::fs::write(&src, b"not a container ffmpeg can demux").unwrap();
+    let dest = dir.path().join("out.webm");
+    let done = finalize("ffmpeg", &src, &dest, "abc123", &meta()).unwrap();
+    assert!(done.untagged);
+    assert_ne!(done.container, Container::Opus);
+    assert!(done.sidecar.is_some());
+    assert!(untagged(&dest));
+}
+
+#[test]
+fn a_channel_name_is_split_only_when_the_title_carries_a_separator() {
+    assert_eq!(split_artist_title("Daft Punk - Get Lucky.webm"), Some(("Daft Punk".into(), "Get Lucky".into())));
+    assert_eq!(split_artist_title("Get Lucky.webm"), None);
+    assert_eq!(split_artist_title(" - Get Lucky.webm"), None);
 }
 
 #[test]
@@ -637,7 +749,7 @@ fn a_missing_ffmpeg_leaves_webm_and_writes_the_sidecar() {
     let src = webm_fixture(dir.path());
     let dest = dir.path().join("out.bin");
     let done = finalize("/nonexistent/ffmpeg", &src, &dest, "abc123", &meta()).unwrap();
-    assert!(!done.remuxed);
+    assert!(done.untagged);
     assert_eq!(done.container, Container::Webm);
     assert_eq!(done.sidecar.as_deref(), Some(dir.path().join("out.bin.json").as_path()));
     assert!(untagged(&dest));
@@ -687,16 +799,16 @@ Expected: FAIL with "unresolved import `finalize`".
 
 `download_audio` builds the output template with `format!("{}/{}.%(ext)s", work_dir.display(), video_id)`, runs `yt-dlp -f bestaudio -o <template> <url>` through `std::process::Command`, fails on a non-zero exit with the tail of stderr, then scans `work_dir` for the file whose stem equals `video_id` and returns it (exactly one such file; otherwise an error listing what was found).
 
-`finalize` calls `maxfetch::media::remux_to_opus(ffmpeg_path, downloaded, dest)`; on `Ok` it removes the source file and returns `remuxed: true`. On `Err` it logs `tracing::warn!`, copies `downloaded` to `dest`, writes `sidecar_payload` with `write_sidecar(dest, ...)` and returns `remuxed: false`. The `Container` in both branches is decided by probing `dest` (`maxfetch::probe::probe`), never by the file extension, so a non-Opus stream reports the container it actually is.
+`finalize` calls `maxfetch::media::remux_to_opus(ffmpeg_path, downloaded, dest)`; on `Ok` it removes the source file and returns `untagged: false`. On `Err` it logs `tracing::warn!`, copies `downloaded` to `dest`, writes `sidecar_payload` with `write_sidecar(dest, ...)` and returns `untagged: true`. The `Container` in both branches is decided by probing `dest` (`maxfetch::probe::probe`), never by the file extension, so a non-Opus stream reports the container it actually is; nothing in this path hardcodes `Container::Webm`. A probe failure on the finished file is returned as an error naming the destination rather than defaulting to `Webm`.
 
-`YoutubeSource::download` creates a temporary work directory under `std::env::temp_dir()`, downloads, finalizes into `dest`, and removes the work directory; a missing `yt-dlp` surfaces as a clear error mentioning the configured path. `search` for a playlist URL runs `run_json(path, &["-J", "--flat-playlist", url])` and maps every entry to a `Release` (`artist` from `release_from_filename`-style splitting of the title, falling back to the video title); `resolve` for `Query::url` does the same for a playlist and `-J <url>` for a single video.
+`YoutubeSource::download` creates a temporary work directory under `std::env::temp_dir()`, downloads, finalizes into `dest`, and removes the work directory; a missing `yt-dlp` surfaces as a clear error mentioning the configured path. `search` for a playlist URL runs `run_json(path, &["-J", "--flat-playlist", url])` and maps every entry to a `Release` through `split_artist_title(&video.title)`, falling back to the video title as the title and `"Unknown Artist"` as the artist; `resolve` for `Query::url` does the same for a playlist and `-J <url>` for a single video.
 
 - [ ] **Step 4: Declare the module and run the test**
 
 Add `pub mod youtube;` to `src/sources/mod.rs` (`src/lib.rs` already declares the top-level module in Task 3).
 
 Run: `cargo test --test youtube_audio`
-Expected: PASS, 5 tests.
+Expected: PASS, 8 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -722,8 +834,9 @@ git commit --author="m1kiru <m1kiru@github.com>" -m "feat(youtube): audio downlo
   - `maxfetch::sources::spotify::UnconfiguredApi` — an implementation whose every method returns an error mentioning that Spotify is not configured; it must never panic.
   - `maxfetch::sources::spotify::isrc(track: &serde_json::Value) -> Option<String>` — `external_ids.isrc`.
   - `maxfetch::sources::spotify::duration_sec(track: &serde_json::Value) -> Option<f64>` — `duration_ms / 1000.0`.
-  - `maxfetch::sources::spotify::track_to_release(track: &serde_json::Value, source_item_id: &str) -> anyhow::Result<Release>` — `title` from `name`, `artist` from `artists[0].name`, `album` from `album.name`, `track_no` from `track_number`, `year` from the first four characters of `album.release_date`, `duration_sec` and `isrc` from the helpers above, `source: SourceId::Spotify`.
-  - `maxfetch::sources::spotify::parse_token_response(body: &serde_json::Value) -> anyhow::Result<String>` — the `access_token` string; a body without it is an error whose message is in Russian and names the missing field.
+  - `maxfetch::sources::spotify::track_to_release(track: &serde_json::Value, source_item_id: &str) -> anyhow::Result<Release>` — `title` from `name`, `artist` from `artists[0].name`, `album` from `album.name`, `track_no` from `track_number`, `year` from the first four characters of `album.release_date`, `duration_sec` and `isrc` from the helpers above, `source: SourceId::Spotify`. This field list is wider than spec section 8.4, which names only `external_ids.isrc` and `duration_ms`; the real Spotify API returns all of them, so the plan keeps the wider mapping and spec section 8.4 will be extended to this list by a separate edit (that edit does not touch this file).
+  - `maxfetch::sources::spotify::parse_token_response(body: &serde_json::Value) -> anyhow::Result<String>` — the `access_token` string; a body without it is an error whose message is in Russian and names the missing field. A body that carries `"error": "invalid_client"` is always an error with the fixed message `"ключи Spotify отклонены"`, even when the HTTP status was 200.
+  - `maxfetch::sources::spotify::SPOTIFY_KEYS_REJECTED` — `const ...: &str = "ключи Spotify отклонены"`, the one string shared by the token parser, the log line and the TUI/AuthState wording.
   - `maxfetch::sources::spotify::SpotifySource` — `struct` with `new(api: std::sync::Arc<dyn SpotifyApi>, client_id: String, client_secret: String) -> SpotifySource`.
   - `maxfetch::sources::spotify::RspotifyApi` — `struct` with `RspotifyApi::new(client_id: String, client_secret: String) -> RspotifyApi`; implements `SpotifyApi` on top of `rspotify` 0.16.1 with the `client_credentials` flow and the three working endpoints.
 
@@ -785,6 +898,23 @@ fn a_response_without_a_token_is_a_readable_error() {
 }
 
 #[test]
+fn a_200_with_an_invalid_client_body_means_the_keys_were_rejected() {
+    let body = serde_json::json!({"error": "invalid_client", "error_description": "Invalid client"});
+    let err = parse_token_response(&body).unwrap_err();
+    assert_eq!(format!("{err}"), maxfetch::sources::spotify::SPOTIFY_KEYS_REJECTED);
+    assert_eq!(format!("{err}"), "ключи Spotify отклонены");
+
+    let status = maxfetch::sources::SourceStatus {
+        id: SourceId::Spotify,
+        capabilities: maxfetch::sources::Capabilities { audio: false, metadata_only: true, lossless: false, needs_auth: true },
+        auth: maxfetch::sources::AuthState::Expired,
+        detail: Some(maxfetch::sources::spotify::SPOTIFY_KEYS_REJECTED.into()),
+    };
+    assert_eq!(status.auth, maxfetch::sources::AuthState::Expired);
+    assert_eq!(status.detail.as_deref(), Some("ключи Spotify отклонены"));
+}
+
+#[test]
 fn the_unconfigured_api_errors_instead_of_panicking() {
     assert!(UnconfiguredApi.track("x").is_err());
     assert!(UnconfiguredApi.search_tracks("x").is_err());
@@ -801,14 +931,14 @@ Expected: FAIL with "unresolved import `maxfetch::sources::spotify`".
 
 Add the dependency: `cargo add rspotify@0.16.1`.
 
-`track_to_release` returns an error naming the missing field when `id` or `name` is absent, ignores entries without `artists`, and never invents a year: an unparsable `release_date` yields `None`. `duration_sec` divides by 1000.0 keeping the fraction. `RspotifyApi` performs the `client_credentials` exchange with `rspotify`'s credentials flow and keeps the resulting token in a `Mutex`, refreshing it when a request answers 401. `search_tracks` uses `/v1/search?q=&type=track,album,artist`, `track` uses `/v1/tracks/{id}`, `album` uses `/v1/albums/{id}`, and `playlist_items` uses `/v1/playlists/{id}/items` — this method is only reachable from the stage-2 user-auth flow, and in stage 1 its error is replaced by the friendly message in Task 6 before it is ever called.
+`track_to_release` returns an error naming the missing field when `id` or `name` is absent, ignores entries without `artists`, and never invents a year: an unparsable `release_date` yields `None`. `duration_sec` divides by 1000.0 keeping the fraction. `parse_token_response` checks the body for an `error` member first and returns `anyhow!(SPOTIFY_KEYS_REJECTED)` for `invalid_client` (and for any other credential-shaped error) before it ever looks for `access_token`, so an HTTP 200 carrying an error body never counts as a successful login; the caller records `AuthState::Expired` on the source and logs the same string with `tracing::warn!`. `RspotifyApi` performs the `client_credentials` exchange with `rspotify`'s credentials flow and keeps the resulting token in a `Mutex`, refreshing it when a request answers 401. `search_tracks` uses `/v1/search?q=&type=track,album,artist`, `track` uses `/v1/tracks/{id}`, `album` uses `/v1/albums/{id}`, and `playlist_items` uses `/v1/playlists/{id}/items` — this method is only reachable from the stage-2 user-auth flow, and in stage 1 its error is replaced by the friendly message in Task 6 before it is ever called.
 
 - [ ] **Step 4: Declare the module and run the test**
 
 Add `pub mod spotify;` to `src/sources/mod.rs`.
 
 Run: `cargo test --test spotify_mapping`
-Expected: PASS, 6 tests.
+Expected: PASS, 7 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -954,6 +1084,7 @@ git commit --author="m1kiru <m1kiru@github.com>" -m "feat(spotify): catalog sour
 - Produces:
   - `maxfetch::sources::registry(config: &Config, credentials: &Credentials) -> Vec<Box<dyn Source>>` — now returns three sources, always in the order Soulseek, YouTube, Spotify, regardless of `config.sources.enabled` (the pipeline filters on `enabled_in`). Construction never opens a socket: `SoulseekSource` connects on its first call, YouTube only stores the configured binary paths, Spotify builds `RspotifyApi` when both credentials are present and `UnconfiguredApi` otherwise.
   - `maxfetch::sources::source_checks(sources: &[Box<dyn Source>]) -> Vec<SourceStatus>` — one `SourceStatus` per source, with `detail` holding the Russian diagnosis: the Soulseek/Spotify credential hint when `auth_state` is `Missing`, the `youtube::binary_status` message when `yt-dlp` is absent, and `None` otherwise.
+  - `maxfetch::sources::enabled_in(ids: &[SourceId], config: &Config) -> Vec<SourceId>` — returns `ids` filtered by `config.sources.enabled`, preserving the input order. An empty `enabled` list means "everything enabled". This is the single filter the pipeline and the TUI use, so `registry` stays a pure constructor and no consumer re-implements the string matching.
   - `maxfetch::sources::skip_reason(source: &dyn Source) -> Option<String>` — `Some("источник <id> пропущен: нет авторизации")` for `AuthState::Missing`, `Some("источник <id> пропущен: ключи протухли")` for `Expired`, `None` for `Ok` and `NotNeeded`.
 
 - [ ] **Step 1: Write the failing test**
@@ -962,7 +1093,7 @@ Create `tests/sources_registry.rs`:
 ```rust
 use maxfetch::config::{Config, Credentials};
 use maxfetch::model::SourceId;
-use maxfetch::sources::{registry, skip_reason, source_checks, AuthState, Source};
+use maxfetch::sources::{enabled_in, registry, skip_reason, source_checks, AuthState, Source};
 
 #[test]
 fn the_registry_holds_the_three_stage_one_sources() {
@@ -972,9 +1103,16 @@ fn the_registry_holds_the_three_stage_one_sources() {
 }
 
 #[test]
-fn a_disabled_source_is_still_registered() {
+fn a_disabled_source_is_still_registered_and_only_filtered_on_use() {
     let mut cfg = Config::default();
     cfg.sources.enabled = vec!["soulseek".into()];
+    let sources = registry(&cfg, &Credentials::default());
+    assert_eq!(sources.len(), 3);
+    let ids: Vec<SourceId> = sources.iter().map(|s| s.id()).collect();
+    assert_eq!(enabled_in(&ids, &cfg), vec![SourceId::Soulseek]);
+
+    cfg.sources.enabled = vec!["youtube".into(), "spotify".into()];
+    assert_eq!(enabled_in(&ids, &cfg), vec![SourceId::Youtube, SourceId::Spotify]);
     assert_eq!(registry(&cfg, &Credentials::default()).len(), 3);
 }
 
@@ -1032,7 +1170,7 @@ Expected: FAIL: `the_registry_holds_the_three_stage_one_sources` sees an empty v
 
 - [ ] **Step 3: Implement the registry, the checks and the skip rule**
 
-`registry` replaces the empty `Vec` and the marker comment of core Task 10 with the three pushes described in the Interfaces block, in a fixed order so the TUI and the CLI render a stable list. `source_checks` builds `SourceStatus { id, capabilities, auth, detail }` per source; the detail for a `Missing` Soulseek is `"нет данных для входа в Soulseek: секция [soulseek] в credentials.toml"`, for a `Missing` Spotify `"нет client_id/client_secret Spotify: секция [spotify] в credentials.toml"`, and the `youtube::binary_status` message is appended when `yt-dlp` is absent even though `auth_state` is `NotNeeded`. `Capabilities` and `SourceStatus` derive `PartialEq` (add the derive to the core definitions if it is missing; that is the only change this stage makes to them).
+`registry` replaces the empty `Vec` and the marker comment of core Task 10 with the three pushes described in the Interfaces block, in a fixed order so the TUI and the CLI render a stable list. `enabled_in` is the one filter both `Pipeline::search` and the sources screen call: it keeps the input order, treats an empty `config.sources.enabled` as "all enabled", and compares the configured names against `SourceId::as_str()`; an unknown name logs `tracing::warn!` and is ignored rather than silently disabling everything. `source_checks` builds `SourceStatus { id, capabilities, auth, detail }` per source; the detail for a `Missing` Soulseek is `"нет данных для входа в Soulseek: секция [soulseek] в credentials.toml"`, for a `Missing` Spotify `"нет client_id/client_secret Spotify: секция [spotify] в credentials.toml"`, and the `youtube::binary_status` message is appended when `yt-dlp` is absent even though `auth_state` is `NotNeeded`. `Capabilities` and `SourceStatus` derive `PartialEq` (add the derive to the core definitions if it is missing; that is the only change this stage makes to them).
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -1058,7 +1196,7 @@ git commit --author="m1kiru <m1kiru@github.com>" -m "feat(sources): register sou
 - Test: `tests/stage1_wiring.rs`
 
 **Interfaces:**
-- Consumes: `maxfetch::auth::auth_status` (core Task 15), `maxfetch::sources::{registry, source_checks, skip_reason, SourceStatus}` (Task 7), `maxfetch::youtube::{move_sidecar, untagged}` (Task 4), `maxfetch::sources::soulseek::describe_peer` (Task 1), `maxfetch::pipeline::Pipeline` (core Task 11), `maxfetch::cli::{Cli, run_with}` (core Task 13), `maxfetch::tui::App` (core Task 14).
+- Consumes: `maxfetch::auth::auth_status` (core Task 15), `maxfetch::sources::{enabled_in, registry, source_checks, skip_reason, SourceStatus}` (Task 7), `maxfetch::youtube::{move_sidecar, untagged}` (Task 4), `maxfetch::sources::soulseek::{describe_peer, PeerCandidate}` (Task 1), `maxfetch::pipeline::Pipeline` (core Task 11), `maxfetch::cli::{Cli, run_with}` (core Task 13), `maxfetch::tui::App` (core Task 14).
 - Produces:
   - `maxfetch::auth::describe_status(status: &SourceStatus) -> String` — `"<id>: доступен"` for `Ok`/`NotNeeded`, `"<id>: нет авторизации"` for `Missing`, `"<id>: ключ протух"` for `Expired`, with the status detail appended after `" — "` when it is present.
   - `maxfetch::cli::playlist_query(url: &str) -> Query` — `Query { text: None, url: Some(url), items: vec![] }`, used by `fetch --playlist`.
@@ -1066,6 +1204,7 @@ git commit --author="m1kiru <m1kiru@github.com>" -m "feat(sources): register sou
   - `Pipeline::download` (modified) — for `SourceId::Youtube` candidates, after moving the file into the library, calls `maxfetch::youtube::move_sidecar(&temporary, &final_path)` and logs the relocation.
   - `maxfetch::tui::App::source_rows(&self) -> Vec<String>` — one `auth::describe_status` line per entry of `self.status`.
   - `maxfetch::tui::App::candidate_badge(&self, candidate: &Candidate, downloaded: Option<&Path>) -> Option<&'static str>` — `Some("UNTAGGED")` when `downloaded` is `Some(path)` and `maxfetch::youtube::untagged(path)` holds, `Some("LOSSY")` for any other candidate whose `quality.lossless` is false, `None` for lossless.
+  - `maxfetch::tui::transfer_line(peer: &PeerCandidate, title: &str) -> String` — the one line the Downloads screen prints per active transfer: `"<title>: пир <username>, слотов <slots>, скорость <speed>"`. When `peer.slots == 0` it returns `"<title>: пир <username> недоступен (0 слотов)"` instead, so a transfer whose peer has no free slots is visibly unusable even though it is still running. Lives in `src/tui/views/downloads.rs` and is re-exported from `maxfetch::tui`; it takes the same `PeerCandidate` the ranked loop chose, so no second source of truth for slots or speed.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1134,6 +1273,20 @@ fn the_sources_screen_starts_with_no_status_lines() {
 }
 
 #[test]
+fn an_active_transfer_names_its_peer_slots_and_speed() {
+    let free = maxfetch::sources::soulseek::PeerCandidate {
+        username: "alice".into(), filename: "f.flac".into(), size: 1, slots: 2, speed: 4,
+        quality: maxfetch::model::Quality { lossless: true, container: maxfetch::model::Container::Flac, bit_depth: Some(16), sample_rate: Some(44100), bitrate_kbps: None },
+    };
+    assert_eq!(maxfetch::tui::transfer_line(&free, "Get Lucky"), "Get Lucky: пир alice, слотов 2, скорость 4");
+
+    let busy = maxfetch::sources::soulseek::PeerCandidate { slots: 0, ..free };
+    let line = maxfetch::tui::transfer_line(&busy, "Get Lucky");
+    assert!(line.contains("недоступен"), "{line}");
+    assert!(line.contains("alice"), "{line}");
+}
+
+#[test]
 fn an_untagged_download_gets_its_own_badge() {
     let dir = tempfile::tempdir().unwrap();
     let webm = dir.path().join("clip.webm");
@@ -1172,14 +1325,14 @@ Expected: FAIL with "unresolved import `maxfetch::auth::describe_status`".
 
 `describe_status` formats exactly as above; `Missing` and `Expired` carry the core's Russian wording so the Sources screen and `sources check` share one string. `cli::run_with` gains the three stage-1 behaviours: `SourcesCommand::Check` prints `describe_status` for every `source_checks` entry, `AuthCommand::Status` prints the same lines plus the note `"вход для soulseek, youtube и spotify появится в следующем этапе"`, and `Command::Fetch { playlist: Some(url), .. }` sends `playlist_query(url)` through the pipeline. `AuthCommand::Login` keeps calling `auth::login`, which is untouched and still returns the core build's "not implemented" error.
 
-`Pipeline::search` gains the skip gate: for each source, `match sources::skip_reason(source.as_ref()) { Some(reason) => { tracing::warn!(%reason, "source skipped"); continue }, None => {} }` before spawning the query. `Pipeline::download` keeps its core order (download, probe, reject, tag, move, record) and inserts the sidecar hop for `SourceId::Youtube` between the move and the database insert.
+`Pipeline::search` gains the skip gate: it first narrows the registry through `sources::enabled_in(&ids, &config)`, then for each source `match sources::skip_reason(source.as_ref()) { Some(reason) => { tracing::warn!(%reason, "source skipped"); continue }, None => {} }` before spawning the query; a source disabled in the config is never queried and its skip reason is logged at `debug` instead. `Pipeline::download` keeps its core order (download, probe, reject, tag, move, record) and inserts the sidecar hop for `SourceId::Youtube` between the move and the database insert.
 
-The TUI: the Sources screen renders `app.source_rows()` from `Pipeline::source_status()` and binds `c` to a re-check; the Candidates screen renders `candidate_badge` in the quality column; the Downloads screen appends `soulseek::describe_peer` for candidates whose `Locator` is `Locator::Soulseek`, looking the peer up through the source's `peers()`. The Settings screen has no Soulseek sharing section, matching the download-only constraint.
+The TUI: the Sources screen renders `app.source_rows()` from `Pipeline::source_status()` and binds `c` to a re-check; the Candidates screen renders `candidate_badge` in the quality column; the Downloads screen prints `tui::transfer_line(&peer, &title)` for every active transfer, taking the `PeerCandidate` that the ranked loop selected so the peer name, the free slots and the speed come from the same struct, and showing the "недоступен" variant as soon as the peer's slots reach zero. The Settings screen has no Soulseek sharing section, matching the download-only constraint.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test --test stage1_wiring`
-Expected: PASS, 6 tests.
+Expected: PASS, 7 tests.
 
 - [ ] **Step 5: Run the whole suite**
 
