@@ -1082,7 +1082,7 @@ git commit --author="m1kiru <m1kiru@github.com>" -m "feat(spotify): catalog sour
 - Consumes: `SoulseekSource` (Task 2), `YoutubeSource` (Task 4), `SpotifySource`/`RspotifyApi`/`UnconfiguredApi` (Tasks 5, 6); `maxfetch::config::{Config, Credentials}`; `Capabilities`, `AuthState`, `Source`, `SourceStatus` (core Task 10).
 - Produces:
   - `maxfetch::sources::registry(config: &Config, credentials: &Credentials) -> Vec<Box<dyn Source>>` — now returns three sources, always in the order Soulseek, YouTube, Spotify, regardless of `config.sources.enabled` (the pipeline filters on `enabled_in`). Construction never opens a socket: `SoulseekSource` connects on its first call, YouTube only stores the configured binary paths, Spotify builds `RspotifyApi` when both credentials are present and `UnconfiguredApi` otherwise.
-  - `maxfetch::sources::source_checks(sources: &[Box<dyn Source>]) -> Vec<SourceStatus>` — one `SourceStatus` per source, with `detail` holding the Russian diagnosis: the Soulseek/Spotify credential hint when `auth_state` is `Missing`, the `youtube::binary_status` message when `yt-dlp` is absent, and `None` otherwise.
+  - `maxfetch::sources::source_statuses(sources: &[Box<dyn Source>]) -> Vec<SourceStatus>` — one `SourceStatus` per source, with `detail` holding the Russian diagnosis: the Soulseek/Spotify credential hint when `auth_state` is `Missing`, the `youtube::binary_status` message when `yt-dlp` is absent, and `None` otherwise. The name and the slice parameter match the canon of stage 2 (line 1688) and stage 3 (line 1172) verbatim: `pub fn source_statuses(sources: &[Box<dyn Source>]) -> Vec<SourceStatus>`; this stage reuses the canonical free function instead of introducing a `config`/`credentials` variant, because the registry already turned those into sources and a second constructor would be a second source of truth. The plural name is shared with `Pipeline::source_statuses` (core Task 11) on purpose: the trait method is the pipeline path the TUI and `sources check` call, and the free function is the single entry point for callers that only hold a source slice (tests, CLI helpers). There is no ambiguity to resolve: the free function is reached by its full path `maxfetch::sources::source_statuses(...)` or through the `sources::` module prefix, and no module both `use`s it unqualified and holds a `Pipeline`; the shorter `statuses_of_all` is not introduced, and there is no `source_checks` alias anywhere.
   - `maxfetch::sources::enabled_in(ids: &[SourceId], config: &Config) -> Vec<SourceId>` — returns `ids` filtered by `config.sources.enabled`, preserving the input order. An empty `enabled` list means "everything enabled". This is the single filter the pipeline and the TUI use, so `registry` stays a pure constructor and no consumer re-implements the string matching. Its per-id helper is `is_enabled(id: &SourceId, config: &Config) -> bool` (core Task 10); `enabled_in` is the only selection function, and there is no second name for it.
   - `maxfetch::sources::skip_reason(source: &dyn Source) -> Option<String>` — `Some("источник <id> пропущен: нет авторизации")` for `AuthState::Missing`, `Some("источник <id> пропущен: ключи протухли")` for `Expired`, `None` for `Ok` and `NotNeeded`.
 
@@ -1092,7 +1092,7 @@ Create `tests/sources_registry.rs`:
 ```rust
 use maxfetch::config::{Config, Credentials};
 use maxfetch::model::SourceId;
-use maxfetch::sources::{enabled_in, registry, skip_reason, source_checks, AuthState, Source};
+use maxfetch::sources::{enabled_in, registry, skip_reason, source_statuses, AuthState, Source};
 
 #[test]
 fn the_registry_holds_the_three_stage_one_sources() {
@@ -1150,7 +1150,7 @@ fn capabilities_describe_each_source() {
 fn a_missing_yt_dlp_is_reported_in_the_source_detail() {
     let mut cfg = Config::default();
     cfg.youtube.yt_dlp_path = "/nonexistent/yt-dlp".into();
-    let statuses = source_checks(&registry(&cfg, &Credentials::default()));
+    let statuses = source_statuses(&registry(&cfg, &Credentials::default()));
     let youtube = statuses.iter().find(|s| s.id == SourceId::Youtube).unwrap();
     assert!(youtube.detail.as_deref().unwrap().contains("yt-dlp"));
     assert_eq!(youtube.auth, AuthState::NotNeeded);
@@ -1172,9 +1172,9 @@ fn unauthorized_sources_get_a_skip_reason() {
 Run: `cargo test --test sources_registry`
 Expected: FAIL: `the_registry_holds_the_three_stage_one_sources` sees an empty vector.
 
-- [ ] **Step 3: Implement the registry, the checks and the skip rule**
+- [ ] **Step 3: Implement the registry, the statuses and the skip rule**
 
-`registry` replaces the empty `Vec` and the marker comment of core Task 10 with the three pushes described in the Interfaces block, in a fixed order so the TUI and the CLI render a stable list. `enabled_in` is the one filter both `Pipeline::search` and the sources screen call: it keeps the input order, treats an empty `config.sources.enabled` as "all enabled", and compares the configured names against `SourceId::as_str()`; an unknown name logs `tracing::warn!` and is ignored rather than silently disabling everything. `source_checks` builds `SourceStatus { id, capabilities, auth, detail }` per source; the detail for a `Missing` Soulseek is `"нет данных для входа в Soulseek: секция [soulseek] в credentials.toml"`, for a `Missing` Spotify `"нет client_id/client_secret Spotify: секция [spotify] в credentials.toml"`, and the `youtube::binary_status` message is appended when `yt-dlp` is absent even though `auth_state` is `NotNeeded`. `Capabilities` and `SourceStatus` derive `PartialEq` (add the derive to the core definitions if it is missing; that is the only change this stage makes to them).
+`registry` replaces the empty `Vec` and the marker comment of core Task 10 with the three pushes described in the Interfaces block, in a fixed order so the TUI and the CLI render a stable list. `enabled_in` is the one filter both `Pipeline::search` and the sources screen call: it keeps the input order, treats an empty `config.sources.enabled` as "all enabled", and compares the configured names against `SourceId::as_str()`; an unknown name logs `tracing::warn!` and is ignored rather than silently disabling everything. `source_statuses` builds `SourceStatus { id, capabilities, auth, detail }` per source; the detail for a `Missing` Soulseek is `"нет данных для входа в Soulseek: секция [soulseek] в credentials.toml"`, for a `Missing` Spotify `"нет client_id/client_secret Spotify: секция [spotify] в credentials.toml"`, and the `youtube::binary_status` message is appended when `yt-dlp` is absent even though `auth_state` is `NotNeeded`. `Capabilities` and `SourceStatus` derive `PartialEq` (add the derive to the core definitions if it is missing; that is the only change this stage makes to them).
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -1200,7 +1200,7 @@ git commit --author="m1kiru <m1kiru@github.com>" -m "feat(sources): register sou
 - Test: `tests/stage1_wiring.rs`
 
 **Interfaces:**
-- Consumes: `maxfetch::auth::auth_status` (core Task 15), `maxfetch::sources::{enabled_in, registry, source_checks, skip_reason, SourceStatus}` (Task 7), `maxfetch::youtube::{move_sidecar, untagged}` (Task 4), `maxfetch::sources::soulseek::{describe_peer, PeerCandidate}` (Task 1), `maxfetch::pipeline::Pipeline` (core Task 11), `maxfetch::cli::{Cli, run_with}` (core Task 13), `maxfetch::tui::App` (core Task 14).
+- Consumes: `maxfetch::auth::auth_status` (core Task 15), `maxfetch::sources::{enabled_in, registry, source_statuses, skip_reason, SourceStatus}` (Task 7), `maxfetch::pipeline::Pipeline::source_statuses` (core Task 11), `maxfetch::youtube::{move_sidecar, untagged}` (Task 4), `maxfetch::sources::soulseek::{describe_peer, PeerCandidate}` (Task 1), `maxfetch::pipeline::Pipeline` (core Task 11), `maxfetch::cli::{Cli, run_with}` (core Task 13), `maxfetch::tui::App` (core Task 14).
 - Produces:
   - `maxfetch::auth::describe_status(status: &SourceStatus) -> String` — `"<id>: доступен"` for `Ok`/`NotNeeded`, `"<id>: нет авторизации"` for `Missing`, `"<id>: ключ протух"` for `Expired`, with the status detail appended after `" — "` when it is present.
   - `maxfetch::cli::playlist_query(url: &str) -> Query` — `Query { text: None, url: Some(url), items: vec![] }`, used by `fetch --playlist`.
@@ -1219,13 +1219,13 @@ use maxfetch::auth::{describe_status, login};
 use maxfetch::cli::{playlist_query, Cli};
 use maxfetch::config::{Config, Credentials};
 use maxfetch::model::SourceId;
-use maxfetch::sources::{registry, source_checks, AuthState, Capabilities};
+use maxfetch::sources::{registry, source_statuses, AuthState, Capabilities};
 
 #[test]
 fn source_statuses_are_rendered_in_russian() {
     let mut cfg = Config::default();
     cfg.youtube.yt_dlp_path = "/nonexistent/yt-dlp".into();
-    let statuses = source_checks(&registry(&cfg, &Credentials::default()));
+    let statuses = source_statuses(&registry(&cfg, &Credentials::default()));
     let soulseek = statuses.iter().find(|s| s.id == SourceId::Soulseek).unwrap();
     let youtube = statuses.iter().find(|s| s.id == SourceId::Youtube).unwrap();
     assert_eq!(describe_status(soulseek), "soulseek: нет авторизации — нет данных для входа в Soulseek: секция [soulseek] в credentials.toml");
@@ -1327,7 +1327,7 @@ Expected: FAIL with "unresolved import `maxfetch::auth::describe_status`".
 
 - [ ] **Step 3: Implement the wiring**
 
-`describe_status` formats exactly as above; `Missing` and `Expired` carry the core's Russian wording so the Sources screen and `sources check` share one string. `cli::run_with` gains the three stage-1 behaviours: `SourcesCommand::Check` prints `describe_status` for every `source_checks` entry, `AuthCommand::Status` prints the same lines plus the note `"вход для soulseek, youtube и spotify появится в следующем этапе"`, and `Command::Fetch { playlist: Some(url), .. }` sends `playlist_query(url)` through the pipeline. `AuthCommand::Login` keeps calling `auth::login`, which is untouched and still returns the core build's "not implemented" error.
+`describe_status` formats exactly as above; `Missing` and `Expired` carry the core's Russian wording so the Sources screen and `sources check` share one string. `cli::run_with` gains the three stage-1 behaviours: `SourcesCommand::Check` prints `describe_status` for every `sources::source_statuses(&registry(&config, &credentials))` entry, `AuthCommand::Status` prints the same lines plus the note `"вход для soulseek, youtube и spotify появится в следующем этапе"`, and `Command::Fetch { playlist: Some(url), .. }` sends `playlist_query(url)` through the pipeline. `AuthCommand::Login` keeps calling `auth::login`, which is untouched and still returns the core build's "not implemented" error.
 
 `Pipeline::search` gains the skip gate: it first narrows the registry through `sources::enabled_in(&ids, &config)`, then for each source `match sources::skip_reason(source.as_ref()) { Some(reason) => { tracing::warn!(%reason, "source skipped"); continue }, None => {} }` before spawning the query; a source disabled in the config is never queried and its skip reason is logged at `debug` instead. `Pipeline::download` keeps its core order (download, probe, reject, tag, move, record) and inserts the sidecar hop for `SourceId::Youtube` between the move and the database insert.
 
