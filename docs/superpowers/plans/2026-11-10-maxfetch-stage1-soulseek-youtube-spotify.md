@@ -35,13 +35,11 @@
 
 The spec is a vision document; these inputs are implied by it but not covered by any explicit requirement. Each is now pinned to a covering test in the task that owns the relevant code, and each records the decision the plan takes.
 
-1. **A peer that stalls after a few megabytes.** The failover test only feeds a transfer that fails immediately; a real stall is a silent std mpsc `Receiver<DownloadStatus>`, so the `stall_timeout_sec` path depends on `recv_timeout` firing between `InProgress` samples, not on the ranked loop. Pinned to Task 2 (`drain_transfer`).
+1. **A peer that fails, stalls, or runs out of slots.** Three peer-level risks, one rule: the run never breaks, the next ranked candidate is tried and no partial file is left behind. The immediate-failure path (the peer hangs up) is covered by `a_failing_peer_falls_over_to_the_next_one`; the silent-stall path — a std mpsc `Receiver<DownloadStatus>` that simply stops delivering samples, so the `stall_timeout_sec` budget is enforced by `recv_timeout` firing between `InProgress` samples and not by the ranked loop — is covered by `a_silent_transfer_is_reported_as_stalled`; the cleanup of an interrupted transfer is covered by `an_interrupted_transfer_leaves_no_partial_file_behind`. Decision: the Soulseek protocol as exposed by `soulseek_rs` 20.0.0 has no offset resume, so an unfinished download is deleted and restarted from zero; a transfer never leaves a `.part` file behind and never appends to one. A peer that fills up (`slots == 0`) while its transfer is running stays visible as unusable: the Downloads screen shows the peer name, its free slots and the transfer speed for every active transfer and marks the peer as unavailable when `slots == 0`, as asserted by `an_active_transfer_names_its_peer_slots_and_speed`. Pinned to Task 2 (`drain_transfer`, `download_ranked`, `Transfer::fetch`) and Task 8 (`tui::transfer_line`).
 2. **A FLAC whose `attribs` map carries none of keys 0, 4 and 5.** Tested by `a_flac_without_bitrate_rate_and_depth_ranks_below_a_known_flac`: such a release lands in the "unknown quality" class and must rank below a FLAC with a known depth or rate, never above it. Decision: never invent a value; the entry keeps every numeric field `None` and `compare_quality` puts it last. Pinned to Task 1 (`quality_from_attributes`).
-3. **A YouTube title that is not a track title** — `"Artist - Topic"`, a 3-hour DJ set, a video with no `track` field and an `uploader` that is a radio station. Decisions: (a) a `- Topic` channel is a loader, so the suffix is stripped and `Topic` never survives as an artist name; (b) anything longer than `MAX_TRACK_SECONDS` (900 s) is a DJ set or a radio broadcast and is rejected by `parse_video` with an error naming the duration; (c) a radio-station uploader with no `track` field is used verbatim as the artist, with the video title as the title and no album, because guessing a split out of a station name would invent data. Three tests pin all three cases. Pinned to Task 3 (`parse_video`).
-4. **The Spotify token endpoint answering 200 with `{"error":"invalid_client"}` in the body.** The mapping test only covers a body that lacks `access_token`; a credential-shaped error body must surface as "ключи Spotify отклонены", never as a raw response dump. The covering test asserts exactly that string (equivalently `AuthState::Expired` on the source). Pinned to Task 5 (`parse_token_response`).
-5. **A WebM whose audio stream is not Opus** (an AAC `m4a` fetched under a `.webm` name, or a remux that exits non-zero on an unusual codec). Two tests cover it: one feeds an AAC stream under a `.webm` name and asserts the probe-derived container is the real codec while the file keeps `.webm`, gets no tags, gets a sidecar and the `UNTAGGED` badge; one keeps `ffmpeg` present but makes the remux fail and asserts the same fallback with no panic. Pinned to Task 4 (`finalize`).
-6. **Resuming an interrupted transfer from an offset.** The Soulseek protocol as exposed by `soulseek_rs` 20.0.0 has no offset resume. Decision: an unfinished download is deleted and restarted from zero; a transfer never leaves a `.part` file behind and never appends to one. Pinned to Task 2 (`Transfer::fetch`, `download_ranked`).
-7. **Peer availability in the Downloads screen.** A peer with no free slots is dropped before ranking, but a transfer already running against a peer that fills up must still be visible as unusable. Decision: the Downloads screen shows the peer name, its free slots and the transfer speed for every active transfer, and marks the peer as unavailable when `slots == 0`. Pinned to Task 8.
+3. **A YouTube title that is not a track title** — `"Artist - Topic"`, a 3-hour DJ set, a video with no `track` field and an `uploader` that is a radio station. Decisions: (a) a `- Topic` channel is a loader, so the suffix is stripped and `Topic` never survives as an artist name (`a_topic_channel_is_a_loader_not_an_artist`); (b) anything longer than `MAX_TRACK_SECONDS` (900 s) is a DJ set or a radio broadcast and is rejected by `parse_video` with an error naming the duration (`a_three_hour_dj_set_is_rejected`); (c) a radio-station uploader with no `track` field is used verbatim as the artist, with the video title as the title and no album, because guessing a split out of a station name would invent data (`a_radio_station_uploader_becomes_the_artist_without_inventing_data`). Pinned to Task 3 (`parse_video`).
+4. **The Spotify token endpoint answering 200 with `{"error":"invalid_client"}` in the body.** The mapping test only covers a body that lacks `access_token`; a credential-shaped error body must surface as "ключи Spotify отклонены", never as a raw response dump. The covering test `a_200_with_an_invalid_client_body_means_the_keys_were_rejected` asserts exactly that string (equivalently `AuthState::Expired` on the source). Pinned to Task 5 (`parse_token_response`).
+5. **A YouTube download that does not end up as a tagged `.opus`.** Two shapes, one fallback: the stream is not Opus (an AAC `m4a` fetched under a `.webm` name) or the remux fails (an unusual codec, or `ffmpeg` is missing at all). The file then stays `.webm`, gets no tags, gets a sidecar JSON next to it and the `UNTAGGED` badge, and the container reported by `finalize` is the one the probe measured, never the one the extension suggests. Covered by `an_aac_stream_under_a_webm_name_reports_its_real_container` (AAC under a `.webm` name), `a_remux_failing_on_an_unusual_input_falls_back_without_panicking` (remux fails, no panic) and `a_missing_ffmpeg_leaves_webm_and_writes_the_sidecar` (no `ffmpeg` at all). Pinned to Task 4 (`finalize`).
 
 ---
 
@@ -638,6 +636,7 @@ git commit --author="m1kiru <m1kiru@github.com>" -m "feat(youtube): yt-dlp json 
 - Modify: `src/youtube.rs`
 - Modify: `src/sources/mod.rs` (declare the source module)
 - Create: `src/sources/youtube.rs`
+- Use: `tests/fixtures/probe/sine_44100_s16.flac` (the FLAC fixture generated and committed by core Task 6; this task only reads it and re-encodes it into a temporary WebM/AAC file, it creates no new fixture file)
 - Test: `tests/youtube_audio.rs`
 
 **Interfaces:**
@@ -834,7 +833,7 @@ git commit --author="m1kiru <m1kiru@github.com>" -m "feat(youtube): audio downlo
   - `maxfetch::sources::spotify::UnconfiguredApi` — an implementation whose every method returns an error mentioning that Spotify is not configured; it must never panic.
   - `maxfetch::sources::spotify::isrc(track: &serde_json::Value) -> Option<String>` — `external_ids.isrc`.
   - `maxfetch::sources::spotify::duration_sec(track: &serde_json::Value) -> Option<f64>` — `duration_ms / 1000.0`.
-  - `maxfetch::sources::spotify::track_to_release(track: &serde_json::Value, source_item_id: &str) -> anyhow::Result<Release>` — `title` from `name`, `artist` from `artists[0].name`, `album` from `album.name`, `track_no` from `track_number`, `year` from the first four characters of `album.release_date`, `duration_sec` and `isrc` from the helpers above, `source: SourceId::Spotify`. This field list is wider than spec section 8.4, which names only `external_ids.isrc` and `duration_ms`; the real Spotify API returns all of them, so the plan keeps the wider mapping and spec section 8.4 will be extended to this list by a separate edit (that edit does not touch this file).
+  - `maxfetch::sources::spotify::release_from_track(track: &serde_json::Value, source_item_id: &str) -> anyhow::Result<Release>` — `title` from `name`, `artist` from `artists[0].name`, `album` from `album.name`, `track_no` from `track_number`, `year` from the first four characters of `album.release_date`, `duration_sec` and `isrc` from the helpers above, `source: SourceId::Spotify`. This field list is wider than spec section 8.4, which names only `external_ids.isrc` and `duration_ms`; the real Spotify API returns all of them, so the plan keeps the wider mapping and spec section 8.4 will be extended to this list by a separate edit (that edit does not touch this file).
   - `maxfetch::sources::spotify::parse_token_response(body: &serde_json::Value) -> anyhow::Result<String>` — the `access_token` string; a body without it is an error whose message is in Russian and names the missing field. A body that carries `"error": "invalid_client"` is always an error with the fixed message `"ключи Spotify отклонены"`, even when the HTTP status was 200.
   - `maxfetch::sources::spotify::SPOTIFY_KEYS_REJECTED` — `const ...: &str = "ключи Spotify отклонены"`, the one string shared by the token parser, the log line and the TUI/AuthState wording.
   - `maxfetch::sources::spotify::SpotifySource` — `struct` with `new(api: std::sync::Arc<dyn SpotifyApi>, client_id: String, client_secret: String) -> SpotifySource`.
@@ -853,7 +852,7 @@ Create `tests/spotify_mapping.rs`:
 ```rust
 use std::path::PathBuf;
 use maxfetch::model::SourceId;
-use maxfetch::sources::spotify::{duration_sec, isrc, parse_token_response, track_to_release, UnconfiguredApi, SpotifyApi};
+use maxfetch::sources::spotify::{duration_sec, isrc, parse_token_response, release_from_track, UnconfiguredApi, SpotifyApi};
 
 fn track_json() -> serde_json::Value {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/spotify/track.json");
@@ -874,7 +873,7 @@ fn the_duration_is_converted_from_milliseconds() {
 
 #[test]
 fn a_track_maps_to_a_spotify_release() {
-    let rel = track_to_release(&track_json(), "4uLU6hMCjMI75M1A2tKUQC").unwrap();
+    let rel = release_from_track(&track_json(), "4uLU6hMCjMI75M1A2tKUQC").unwrap();
     assert_eq!(rel.title, "Get Lucky");
     assert_eq!(rel.artist, "Daft Punk");
     assert_eq!(rel.album.as_deref(), Some("Random Access Memories"));
@@ -931,7 +930,7 @@ Expected: FAIL with "unresolved import `maxfetch::sources::spotify`".
 
 Add the dependency: `cargo add rspotify@0.16.1`.
 
-`track_to_release` returns an error naming the missing field when `id` or `name` is absent, ignores entries without `artists`, and never invents a year: an unparsable `release_date` yields `None`. `duration_sec` divides by 1000.0 keeping the fraction. `parse_token_response` checks the body for an `error` member first and returns `anyhow!(SPOTIFY_KEYS_REJECTED)` for `invalid_client` (and for any other credential-shaped error) before it ever looks for `access_token`, so an HTTP 200 carrying an error body never counts as a successful login; the caller records `AuthState::Expired` on the source and logs the same string with `tracing::warn!`. `RspotifyApi` performs the `client_credentials` exchange with `rspotify`'s credentials flow and keeps the resulting token in a `Mutex`, refreshing it when a request answers 401. `search_tracks` uses `/v1/search?q=&type=track,album,artist`, `track` uses `/v1/tracks/{id}`, `album` uses `/v1/albums/{id}`, and `playlist_items` uses `/v1/playlists/{id}/items` — this method is only reachable from the stage-2 user-auth flow, and in stage 1 its error is replaced by the friendly message in Task 6 before it is ever called.
+`release_from_track` returns an error naming the missing field when `id` or `name` is absent, ignores entries without `artists`, and never invents a year: an unparsable `release_date` yields `None`. `duration_sec` divides by 1000.0 keeping the fraction. `parse_token_response` checks the body for an `error` member first and returns `anyhow!(SPOTIFY_KEYS_REJECTED)` for `invalid_client` (and for any other credential-shaped error) before it ever looks for `access_token`, so an HTTP 200 carrying an error body never counts as a successful login; the caller records `AuthState::Expired` on the source and logs the same string with `tracing::warn!`. `RspotifyApi` performs the `client_credentials` exchange with `rspotify`'s credentials flow and keeps the resulting token in a `Mutex`, refreshing it when a request answers 401. `search_tracks` uses `/v1/search?q=&type=track,album,artist`, `track` uses `/v1/tracks/{id}`, `album` uses `/v1/albums/{id}`, and `playlist_items` uses `/v1/playlists/{id}/items` — this method is only reachable from the stage-2 user-auth flow, and in stage 1 its error is replaced by the friendly message in Task 6 before it is ever called.
 
 - [ ] **Step 4: Declare the module and run the test**
 
@@ -956,11 +955,11 @@ git commit --author="m1kiru <m1kiru@github.com>" -m "feat(spotify): json mapping
 - Test: `tests/spotify_source.rs`
 
 **Interfaces:**
-- Consumes: `SpotifyApi`, `track_to_release`, `SpotifySource` (Task 5); `maxfetch::match::match_key` (core Task 2); `maxfetch::sources::{AuthState, Capabilities, Query, QueryItem, Source}` (core Task 10).
+- Consumes: `SpotifyApi`, `release_from_track`, `SpotifySource` (Task 5); `maxfetch::match::match_key` (core Task 2); `maxfetch::sources::{AuthState, Capabilities, Query, QueryItem, Source}` (core Task 10).
 - Produces:
   - `maxfetch::sources::spotify::playlist_requires_auth_message() -> &'static str` — exactly `"нужна авторизация Spotify, она появится на этапе 2"`.
   - `maxfetch::sources::spotify::adopt_reference(target: &mut Release, reference: &Release) -> bool` — overwrites `target.title`, `target.artist`, `target.album` and `target.isrc` from `reference` when `target.isrc` equals `reference.isrc`, or when both ISRCs are `None` and `match_key(target) == match_key(reference)`; returns whether anything was adopted. `duration_sec`, `track_no` and `year` are never touched.
-  - `impl Source for SpotifySource`: `id` → `SourceId::Spotify`; `capabilities` → `Capabilities { audio: false, metadata_only: true, lossless: false, needs_auth: true }`; `auth_state` → `Missing` when either credential string is empty, else `Ok`; `search` → `track_to_release` for every `search_tracks` hit; `resolve` → the track/album for `QueryItem::Track`/`QueryItem::Album`, and `Err(playlist_requires_auth_message())` for `QueryItem::Playlist { source: SourceId::Spotify, .. }` **before** calling the API; `candidates` → `Vec::new()`; `download` → `Err` with `"Spotify не отдаёт аудио: источник только для метаданных"`.
+  - `impl Source for SpotifySource`: `id` → `SourceId::Spotify`; `capabilities` → `Capabilities { audio: false, metadata_only: true, lossless: false, needs_auth: true }`; `auth_state` → `Missing` when either credential string is empty, else `Ok`; `search` → `release_from_track` for every `search_tracks` hit; `resolve` → the track/album for `QueryItem::Track`/`QueryItem::Album`, and `Err(playlist_requires_auth_message())` for `QueryItem::Playlist { source: SourceId::Spotify, .. }` **before** calling the API; `candidates` → `Vec::new()`; `download` → `Err` with `"Spotify не отдаёт аудио: источник только для метаданных"`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1057,7 +1056,7 @@ Expected: FAIL with "no method named `resolve`".
 
 - [ ] **Step 3: Implement the trait**
 
-`resolve` inspects `q.items` first: a `QueryItem::Playlist { source: SourceId::Spotify, .. }` returns `Err(anyhow!("{}", playlist_requires_auth_message()))` without touching `self.api`; `QueryItem::Track` calls `track` and `track_to_release`; `QueryItem::Album` calls `album` and maps every track of it. `search` maps every hit of `search_tracks` and drops entries that fail to map, logging them with `tracing::warn!`. `adopt_reference` implements exactly the two acceptance conditions and leaves `source` and `source_item_id` of the target alone.
+`resolve` inspects `q.items` first: a `QueryItem::Playlist { source: SourceId::Spotify, .. }` returns `Err(anyhow!("{}", playlist_requires_auth_message()))` without touching `self.api`; `QueryItem::Track` calls `track` and `release_from_track`; `QueryItem::Album` calls `album` and maps every track of it. `search` maps every hit of `search_tracks` and drops entries that fail to map, logging them with `tracing::warn!`. `adopt_reference` implements exactly the two acceptance conditions and leaves `source` and `source_item_id` of the target alone.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -1223,7 +1222,7 @@ use maxfetch::model::SourceId;
 use maxfetch::sources::{registry, source_checks, AuthState, Capabilities};
 
 #[test]
-fn source_status_lines_are_russian() {
+fn source_statuses_are_rendered_in_russian() {
     let mut cfg = Config::default();
     cfg.youtube.yt_dlp_path = "/nonexistent/yt-dlp".into();
     let statuses = source_checks(&registry(&cfg, &Credentials::default()));
@@ -1332,7 +1331,7 @@ Expected: FAIL with "unresolved import `maxfetch::auth::describe_status`".
 
 `Pipeline::search` gains the skip gate: it first narrows the registry through `sources::enabled_in(&ids, &config)`, then for each source `match sources::skip_reason(source.as_ref()) { Some(reason) => { tracing::warn!(%reason, "source skipped"); continue }, None => {} }` before spawning the query; a source disabled in the config is never queried and its skip reason is logged at `debug` instead. `Pipeline::download` keeps its core order (download, probe, reject, tag, move, record) and inserts the sidecar hop for `SourceId::Youtube` between the move and the database insert.
 
-The TUI: the Sources screen renders `app.source_rows()` from `Pipeline::source_status()` and binds `c` to a re-check; the Candidates screen renders `candidate_badge` in the quality column; the Downloads screen prints `tui::transfer_line(&peer, &title)` for every active transfer, taking the `PeerCandidate` that the ranked loop selected so the peer name, the free slots and the speed come from the same struct, and showing the "недоступен" variant as soon as the peer's slots reach zero. The Settings screen has no Soulseek sharing section, matching the download-only constraint.
+The TUI: the Sources screen renders `app.source_rows()` from `Pipeline::source_statuses()` and binds `c` to a re-check; the Candidates screen renders `candidate_badge` in the quality column; the Downloads screen prints `tui::transfer_line(&peer, &title)` for every active transfer, taking the `PeerCandidate` that the ranked loop selected so the peer name, the free slots and the speed come from the same struct, and showing the "недоступен" variant as soon as the peer's slots reach zero. The Settings screen has no Soulseek sharing section, matching the download-only constraint.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
