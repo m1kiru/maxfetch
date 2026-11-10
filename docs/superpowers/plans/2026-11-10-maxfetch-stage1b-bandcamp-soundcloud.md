@@ -38,11 +38,13 @@
 
 The spec is a vision document; these inputs are implied by it but not covered by any explicit requirement. Each has a test pinned to the task that owns the relevant code.
 
-1. **A Bandcamp free download whose `statdownload` chain answers with a stale `fsig`.** Expected: the `/download/` -> `/statdownload/` rewrite plus a `&.rand=` nonce produces a fresh `retry_url`, and a chain that still fails is reported as «нет бесплатного промо» instead of surfacing as an error. Pinned to Task 3 (chain) and Task 5 (source).
-2. **A Bandcamp album whose ZIP holds 12 tracks but only 3 are wanted.** Expected: the archive is unpacked once, each member becomes an independent candidate with its own track number and title, the other 9 are simply absent from the result, and the ZIP is fetched a single time. Pinned to Task 4 (archive) and Task 5 (source).
+1. **A Bandcamp free download whose `statdownload` chain answers with a stale `fsig`, and a chain that answers with no `retry_url` at all.** Expected: the `/download/` -> `/statdownload/` rewrite plus a `&.rand=` nonce produces a fresh `retry_url`; a `var _statDL_result` object that carries `"result":"err"` and `errortype` but no `retry_url` is *not* an error — the source logs «нет бесплатного промо», returns `Ok(vec![])` and stays enabled. Pinned to Task 3 (chain) and Task 5 (source, test `a_statdl_result_without_a_retry_url_reports_no_promo`).
+2. **A Bandcamp album whose ZIP holds 12 tracks but only 3 are wanted.** Expected: the archive is unpacked once, each member becomes an independent candidate with its own track number and title, exactly the three requested members are written, the other 9 are simply absent from the result, and the ZIP is fetched a single time — asserted by `MockServer::request_count("/download/album") == 1` after three downloads of one album. Pinned to Task 4 (archive) and Task 5 (source).
 3. **A Bandcamp release that has no free download at all.** Expected: «нет бесплатного промо» with an empty candidate list, not an error, not a disabled source and not a fallback to the `mp3-128` stream. Pinned to Task 5 (source).
 4. **A SoundCloud track whose `client_id` has rotated and the API answers 401.** Expected: the id is re-scraped from `soundcloud.com`, the request is retried exactly once, and a second 401 marks this item failed without touching the other sources. Pinned to Task 6 (scrape) and Task 8 (source).
-5. **A SoundCloud track that is lossless on the platform but offers only AAC without OAuth.** Expected: the lossy result is honest — `lossless = false`, `aac_160k`, the `maxfetch: source=lossy` comment, the `LOSSY` badge — and the platform's lossless claim never reaches the database. Pinned to Task 7 (classification) and Task 9 (pipeline).
+5. **A SoundCloud track that is lossless on the platform but offers only AAC without OAuth.** Expected: the lossy result is honest — `lossless = false`, `aac_160k`, the `maxfetch: source=lossy` comment, the `LOSSY` badge — and the platform's lossless claim never reaches the database. The pipeline test uses a stub that delivers a *real* MP3 128 kbps file, so the probed quality stays lossy and the comment is written from measured bytes, not from the claim. Pinned to Task 7 (classification) and Task 9 (pipeline, test `a_soundcloud_only_run_records_an_honest_lossy_track`).
+6. **A Bandcamp member whose `retry_url` carries an `enc` this stage does not know.** Expected: the member is skipped with the user-facing line «неизвестный формат <enc> у трека <title>», the remaining members still become candidates, and the run report shows the number of skipped tracks with that reason. The source stays `Ok`. Pinned to Task 5 (source, test `an_unknown_encoding_skips_only_that_member`).
+7. **A Bandcamp album promo that answers with an HTML page instead of a ZIP.** Expected: the body is discarded (its `PK\x03\x04` signature is absent), a warning «страница загрузки вернула не архив» is logged, no candidate is produced for the members of that archive, and the source is not disabled. A *track* promo is the exception: there the `/download/track` answer is the audio file itself, so a non-ZIP body is the single-track candidate. Pinned to Task 5 (source, test `an_html_body_instead_of_a_zip_yields_no_candidates`).
 
 ---
 
@@ -201,14 +203,14 @@ git commit -m "feat(bandcamp): fixture replay harness and url resolution"
 **Interfaces:**
 - Consumes: `maxfetch::model::{Release, SourceId}` (core Task 1), `TralbumKind`, `TralbumType` (Task 1).
 - Produces:
-  - `maxfetch::sources::bandcamp::FuzzyHit` — `struct { kind: TralbumKind, id: u64 }`, `Debug + PartialEq`.
-  - `maxfetch::sources::bandcamp::parse_fuzzy_search(json: &str) -> anyhow::Result<Vec<FuzzyHit>>` — reads only `results[].type` (`"b"`/`"a"`/`"t"`) and `results[].id`; unknown types are skipped.
+  - `maxfetch::sources::bandcamp::FuzzyHit` — `struct { kind: TralbumKind, id: u64, band_id: Option<u64>, location: Option<String> }`, `Debug + PartialEq`. `id` is the hit's `item_id` for album/track results and the `band_id` for artist results; `band_id` is what `tralbum_details` needs, so a hit that has none cannot be resolved.
+  - `maxfetch::sources::bandcamp::parse_fuzzy_search(json: &str) -> anyhow::Result<Vec<FuzzyHit>>` — per `results[]` element it reads exactly these fields: `type` (`"b"`/`"a"`/`"t"`; a missing `type` falls back to `item_type` `"a"`/`"t"`; anything else is skipped), `item_id` (the hit `id`; an artist result takes `band_id` instead because it has no `item_id`), `band_id` (the direct field, or, when it is absent on an album/track result, the numeric value of the `band_id=` query parameter inside `location`), and `location` (kept verbatim). A missing `band_id` and a missing `location` leave the field `None` and never fail the parse.
   - `maxfetch::sources::bandcamp::BandcampTrack` — `struct { track_id: u64, title: String, track_num: u32, duration_sec: f64, band_name: String, album_title: String, is_streamable: bool, track_url: String }`, `Clone + Debug`.
   - `maxfetch::sources::bandcamp::BandcampRelease` — `struct { tralbum_id: u64, tralbum_type: TralbumType, title: String, artist: String, release_date_unix: u64, free_download: bool, is_purchasable: bool, price: Option<f64>, currency: Option<String>, has_digital_download: bool, tracks: Vec<BandcampTrack> }`, `Clone + Debug`.
   - `maxfetch::sources::bandcamp::parse_tralbum_details(json: &str) -> anyhow::Result<BandcampRelease>`.
   - `BandcampRelease::to_releases(&self, page_url: &str) -> Vec<Release>` — one `Release` per streamable track, `source: SourceId::Bandcamp`, `source_item_id: format!("{page_url}|{track_id}")`, `isrc: None`, `year` from `release_date_unix`, `album` = `Some(album_title)` when non-empty, `duration_sec` = `Some(duration_sec)`, `track_no` = `Some(track_num)`.
   - `maxfetch::sources::bandcamp::split_source_item_id(id: &str) -> Option<(&str, u64)>` — inverse of `to_releases`, split at the last `|`.
-  - `maxfetch::sources::bandcamp::DiscographyItem` — `struct { item_id: u64, item_type: TralbumType, title: String, release_date_unix: u64 }`.
+  - `maxfetch::sources::bandcamp::DiscographyItem` — `struct { item_id: u64, item_type: TralbumType, title: String, release_date_unix: u64 }`, `Clone + Debug + PartialEq`.
   - `maxfetch::sources::bandcamp::parse_band_details(json: &str) -> anyhow::Result<Vec<DiscographyItem>>` — accepts `"album"`/`"track"` and `"a"`/`"t"` for `item_type`, skips anything else.
 
 - [ ] **Step 1: Write the failing test**
@@ -237,6 +239,25 @@ fn search_hits_map_the_three_result_types() {
     assert_eq!(hits[1].id, 2814);
     assert_eq!(hits[2].kind, TralbumKind::Track);
     assert_eq!(hits[2].id, 909);
+}
+
+#[test]
+fn an_album_hit_carries_the_band_id_tralbum_details_needs() {
+    let hits = parse_fuzzy_search(&read("bandcamp/fuzzysearch.json")).unwrap();
+    assert_eq!(hits[1].band_id, Some(4171));
+    assert_eq!(hits[1].location.as_deref(), Some("https://nightwave.bandcamp.com/album/night-drive?band_id=4171"));
+    assert_eq!(hits[2].band_id, Some(4171));
+    assert_eq!(hits[0].band_id, Some(4171));
+}
+
+#[test]
+fn an_album_hit_without_a_direct_band_id_reads_it_from_location() {
+    let hits = parse_fuzzy_search(
+        r#"{"results":[{"type":"a","item_id":2814,"item_type":"a","location":"https://nightwave.bandcamp.com/album/night-drive?band_id=4171","name":"Night Drive"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(hits[0].band_id, Some(4171));
+    assert_eq!(hits[0].id, 2814);
 }
 
 #[test]
@@ -315,13 +336,13 @@ Expected: FAIL with "cannot find function `parse_fuzzy_search`".
 `tests/fixtures/bandcamp/fuzzysearch.json`:
 ```json
 {"results":[
-  {"id":4171,"type":"b","name":"Nightwave"},
-  {"id":2814,"type":"a","name":"Night Drive"},
-  {"id":909,"type":"t","name":"Neon"},
-  {"id":5,"type":"x","name":"noise"}
+  {"type":"b","band_id":4171,"location":"https://nightwave.bandcamp.com","name":"Nightwave"},
+  {"type":"a","item_id":2814,"item_type":"a","location":"https://nightwave.bandcamp.com/album/night-drive?band_id=4171","name":"Night Drive"},
+  {"type":"t","item_id":909,"item_type":"t","band_id":4171,"location":"https://nightwave.bandcamp.com/track/neon","name":"Neon"},
+  {"type":"x","item_id":5,"name":"noise"}
 ]}
 ```
-Only `type` and `id` are read; the extra `name` is what the service really returns and must not affect the parser.
+The album hit deliberately omits a direct `band_id` and carries it only inside `location`, which is the shape the live endpoint returns and the reason `parse_fuzzy_search` must read both: without a `band_id` the hit cannot be resolved through `tralbum_details`. `item_id` is the hit id; the extra `name` is what the service really returns and must not affect the parser.
 
 `tests/fixtures/bandcamp/tralbum_details_album.json`:
 ```json
@@ -345,14 +366,14 @@ Only `type` and `id` are read; the extra `name` is what the service really retur
 
 - [ ] **Step 4: Implement the parsers**
 
-`parse_fuzzy_search` walks `json["results"]` as an array, reads `type` and `id` per element, maps `"b"`/`"a"`/`"t"` and skips everything else. `parse_tralbum_details` reads the scalar fields with fallbacks (`price`, `currency` optional; `free_download`, `is_purchasable`, `has_digital_download` default to `false`) and maps `tracks[]` into `BandcampTrack`; a missing `track_num` takes the array position plus one, a missing `duration` becomes `0.0`. `year` in `to_releases` comes from `chrono::DateTime::from_timestamp(release_date_unix as i64, 0)`. `split_source_item_id` splits at the **last** `|` so a page URL may itself contain one.
+`parse_fuzzy_search` walks `json["results"]` as an array and, per element, takes `type` (falling back to `item_type` when `type` is absent), `item_id` as the hit id (an artist result uses `band_id` because it has no `item_id`), `band_id` from the direct field or from the `band_id=` query parameter of `location`, and `location` verbatim; `"b"`/`"a"`/`"t"` map to the three kinds and everything else is skipped. Without the `band_id` an album or track hit cannot be passed to `tralbum_details`, so both sources are needed. `parse_tralbum_details` reads the scalar fields with fallbacks (`price`, `currency` optional; `free_download`, `is_purchasable`, `has_digital_download` default to `false`) and maps `tracks[]` into `BandcampTrack`; a missing `track_num` takes the array position plus one, a missing `duration` becomes `0.0`. `year` in `to_releases` comes from `chrono::DateTime::from_timestamp(release_date_unix as i64, 0)`. `split_source_item_id` splits at the **last** `|` so a page URL may itself contain one.
 
-Add `tralbum_json(track_count: u32) -> String` to `tests/support/mod.rs`: a `serde_json::json!` payload with `id: 2814`, `title: "Night Drive"`, `tralbum_artist: "Nightwave"`, `release_date: 1609459200`, `free_download: true`, and `tracks[i] = {track_id: 9000 + i, title: "Track <i>", track_num: i, duration: 200.0 + i, band_name: "Nightwave", album_title: "Night Drive", is_streamable: true, track_url: "https://nightwave.bandcamp.com/track/track-<i>", streaming_url: "..."}`.
+Add `tralbum_json(track_count: u32) -> String` to `tests/support/mod.rs`: a `serde_json::json!` payload with `id: 2814`, `title: "Night Drive"`, `tralbum_artist: "Nightwave"`, `release_date: 1609459200`, `free_download: true`, and one-based `tracks[i] = {track_id: 9000 + i, title: "Track <i+1>", track_num: i + 1, duration: 200.0 + i, band_name: "Nightwave", album_title: "Night Drive", is_streamable: true, track_url: "https://nightwave.bandcamp.com/track/track-<i+1>", streaming_url: "..."}` for `i` in `1..=track_count`. Numbering starts at one because `track_num` is the position inside the archive and `track_number_from_stem` compares against it; a helper starting at zero would silently hide an off-by-one between the tralbum metadata and the archive members.
 
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `cargo test --test bandcamp_catalog`
-Expected: PASS, 8 tests.
+Expected: PASS, 10 tests.
 
 - [ ] **Step 6: Commit**
 
@@ -375,13 +396,26 @@ git commit -m "feat(bandcamp): fuzzy search, discography and tralbum metadata"
 - Produces:
   - `maxfetch::sources::bandcamp::DataTralbum` — `struct { free_download_page: Option<String> }`, `Debug + PartialEq`.
   - `maxfetch::sources::bandcamp::parse_data_tralbum(html: &str) -> Option<DataTralbum>` — reads the `data-tralbum` attribute of the page's `<script>`, HTML-unescapes it, parses it as JSON and returns `free_download_page`.
-  - `maxfetch::sources::bandcamp::statdownload_url(download_url: &str, nonce: u64) -> Option<String>` — replaces the trailing `/download` path segment (with or without a trailing slash) by `/statdownload` and appends `&.rand=<nonce>`; `None` when the path carries no such segment.
+  - `maxfetch::sources::bandcamp::statdownload_url(download_url: &str, nonce: u64) -> Option<String>` — replaces the `/download` path segment (with or without a trailing slash) by `/statdownload`, keeps the original query string, and appends `&.rand=<nonce>`. The separator is chosen by the source URL: `?` when it has no query string, `&` when it has one — so the result is always a valid URL and never `.../statdownload&.rand=N` without a `?`. `None` when the path carries no such segment.
   - `maxfetch::sources::bandcamp::StatDownloadResult` — `struct { retry_url: Option<String>, err_type: Option<String> }`, `Debug + PartialEq`.
   - `maxfetch::sources::bandcamp::parse_statdownload_result(body: &str) -> Option<StatDownloadResult>` — finds `var _statDL_result = ` and parses the JSON object that follows.
   - `maxfetch::sources::bandcamp::is_expired_download(status: u16, body: &str) -> bool` — `status == 403 && body.trim() == "Download Expired"`.
   - `maxfetch::sources::bandcamp::retry_encoding(retry_url: &str) -> String` — the current value of the `enc` query parameter, `"flac"` when it is absent. This is the encoding the promo archive really contains: it is chosen by Bandcamp, not by us, so a candidate carries exactly this value and never invents a different one.
-  - `maxfetch::sources::bandcamp::FREE_DOWNLOAD_FORMATS: [&str; 8]` = `["flac", "alac", "wav", "aiff", "vorbis", "mp3-v0", "mp3-320", "aac-hi"]`.
-  - `maxfetch::sources::bandcamp::format_quality(fmt: &str) -> Option<Quality>` — `flac`/`alac`/`wav`/`aiff` are lossless with all numerics `None`; `mp3-320` is lossy `Mp3` with `Some(320)`; `mp3-v0` and `vorbis` are lossy with `bitrate_kbps: None`; `aac-hi` is lossy `M4aAac` with `None`; unknown keys (including `mp3-128`) give `None`.
+  - `maxfetch::sources::bandcamp::FREE_DOWNLOAD_FORMATS: [&str; 8]` = `["flac", "alac", "wav", "vorbis", "mp3-v0", "mp3-320", "aac-hi", "mp3-128"]` — exactly the eight keys of spec §8.2 (`flac`, `mp3-v0`, `mp3-320`, `aac-hi`, `wav`, `alac`, `vorbis`, `mp3-128`), grouped lossless-first so the ordering test holds. `aiff` is not in §8.2 and is not offered.
+  - `maxfetch::sources::bandcamp::format_quality(fmt: &str) -> Option<Quality>` — the single place that maps a Bandcamp format key to a `Quality`. Container per key (spec §8.2):
+
+    | key | container | lossless | bitrate_kbps |
+    | --- | --- | --- | --- |
+    | `flac` | `Container::Flac` | true | `None` |
+    | `alac` | `Container::M4aAac` | false | `None` |
+    | `wav` | `Container::Wav` | true | `None` |
+    | `vorbis` | `Container::Opus` | false | `None` |
+    | `mp3-v0` | `Container::Mp3` | false | `None` |
+    | `mp3-320` | `Container::Mp3` | false | `Some(320)` |
+    | `aac-hi` | `Container::M4aAac` | false | `None` |
+    | `mp3-128` | `Container::Mp3` | false | `Some(128)` |
+
+    `alac` is the one deliberate asymmetry: Apple Lossless is really lossless, but the core has no separate container for it and `Container::M4aAac.is_lossless() == false`, so the quality reports `lossless: false` with the `M4aAac` container and carries no lossless claim; the delivered bytes are still written untouched, and the probe of the stored file (which sees the ALAC codec) is what the database records. Every other key leaves `bit_depth` and `sample_rate` as `None` because only the probe may fill measured values; `mp3-v0` is VBR and therefore carries `bitrate_kbps: None` rather than a guess. Keys outside the table give `None`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -414,7 +448,13 @@ fn a_page_without_a_data_tralbum_blob_has_no_free_download_page() {
 #[test]
 fn a_plain_download_url_is_rewritten_to_statdownload_with_a_nonce() {
     let url = statdownload_url("https://nightwave.bandcamp.com/album/night-drive/download", 12345).unwrap();
-    assert_eq!(url, "https://nightwave.bandcamp.com/album/night-drive/statdownload&.rand=12345");
+    assert_eq!(url, "https://nightwave.bandcamp.com/album/night-drive/statdownload?&.rand=12345");
+}
+
+#[test]
+fn a_download_url_that_already_has_a_query_keeps_it_before_the_nonce() {
+    let url = statdownload_url("https://nightwave.bandcamp.com/album/night-drive/download?from=embed", 12345).unwrap();
+    assert_eq!(url, "https://nightwave.bandcamp.com/album/night-drive/statdownload?from=embed&.rand=12345");
 }
 
 #[test]
@@ -461,20 +501,49 @@ fn flac_is_lossless_and_mp3_320_carries_its_bitrate() {
     assert_eq!(flac.container, Container::Flac);
     assert_eq!(flac.bit_depth, None);
     assert_eq!(flac.sample_rate, None);
-
-    let aiff = format_quality("aiff").unwrap();
-    assert!(aiff.lossless && aiff.container == Container::Aiff);
+    assert_eq!(flac.bitrate_kbps, None);
 
     let mp3 = format_quality("mp3-320").unwrap();
     assert!(!mp3.lossless);
     assert_eq!(mp3.container, Container::Mp3);
     assert_eq!(mp3.bitrate_kbps, Some(320));
+}
+
+#[test]
+fn every_free_download_format_has_a_fixed_container_and_bitrate() {
+    let flac = format_quality("flac").unwrap();
+    assert!(flac.lossless);
+    assert_eq!(flac.container, Container::Flac);
+
+    let alac = format_quality("alac").unwrap();
+    assert_eq!(alac.container, Container::M4aAac);
+    assert!(!alac.lossless);
+    assert_eq!(alac.bitrate_kbps, None);
+
+    let wav = format_quality("wav").unwrap();
+    assert!(wav.lossless);
+    assert_eq!(wav.container, Container::Wav);
+
+    let vorbis = format_quality("vorbis").unwrap();
+    assert!(!vorbis.lossless);
+    assert_eq!(vorbis.container, Container::Opus);
+    assert_eq!(vorbis.bitrate_kbps, None);
+
+    let v0 = format_quality("mp3-v0").unwrap();
+    assert!(!v0.lossless);
+    assert_eq!(v0.container, Container::Mp3);
+    assert_eq!(v0.bitrate_kbps, None);
 
     let aac = format_quality("aac-hi").unwrap();
+    assert!(!aac.lossless);
     assert_eq!(aac.container, Container::M4aAac);
     assert_eq!(aac.bitrate_kbps, None);
 
-    assert!(format_quality("mp3-128").is_none());
+    let mp3_128 = format_quality("mp3-128").unwrap();
+    assert!(!mp3_128.lossless);
+    assert_eq!(mp3_128.container, Container::Mp3);
+    assert_eq!(mp3_128.bitrate_kbps, Some(128));
+
     assert_eq!(FREE_DOWNLOAD_FORMATS[0], "flac");
     assert_eq!(FREE_DOWNLOAD_FORMATS.len(), 8);
 }
@@ -488,8 +557,8 @@ fn the_format_list_keeps_lossless_keys_ahead_of_lossy_ones() {
 
 #[test]
 fn unknown_format_keys_are_rejected() {
-    assert_eq!(format_quality("mp3-128"), None);
     assert_eq!(format_quality("zip"), None);
+    assert_eq!(format_quality("aiff"), None);
 }
 ```
 
@@ -513,14 +582,14 @@ var _statDL_result = {"result":"err","retry_url":"https://nightwave.bandcamp.com
 
 `parse_data_tralbum` locates `data-tralbum="`, takes everything up to the closing `"`, and unescapes `&quot;` -> `"`, `&amp;` -> `&`, `&#39;` -> `'`, then parses with `serde_json`. It returns `Some(DataTralbum { free_download_page })` even when the key is absent, so callers can tell "no blob" (`None`) from "blob without a promo" (`Some` with `free_download_page: None`).
 
-`statdownload_url` splits the URL at `?`, requires the path to end with `/download` or contain `/download/`, replaces that segment with `/statdownload`, and returns `format!("{}?{}&.rand={}", path, query, nonce)`; when there is no query it returns `format!("{}&.rand={}", path, nonce)`. This is the exact shape Bandcamp answers: the 403 body is replaced by the `_statDL_result` object carrying a fresh `fsig`.
+`statdownload_url` splits the URL at the first `?` into a path and an optional query, requires the path to end with `/download` or contain `/download/`, replaces that segment with `/statdownload`, and appends the nonce with the separator that matches the original URL: `?` when the source URL had no query string (`{path}/statdownload?&.rand={nonce}`) and `&` when it had one (`{path}/statdownload?{query}&.rand={nonce}`). Writing `&` into a URL without a query would produce `.../statdownload&.rand=N`, which no client can parse, so the separator is derived from the source URL and never hardcoded. This is the exact shape Bandcamp answers: the 403 body is replaced by the `_statDL_result` object carrying a fresh `fsig`.
 
-`retry_encoding` parses the query string of the `retry_url` and returns the `enc` value, defaulting to `flac`. `format_quality` is the single place that maps a Bandcamp format key to a `Quality`; it never fills `bit_depth`, `sample_rate` or an absent bitrate, because the probe is the only source of measured values.
+`retry_encoding` parses the query string of the `retry_url` and returns the `enc` value, defaulting to `flac`. `format_quality` is the single place that maps a Bandcamp format key to a `Quality`; it fixes the container per the table in the Interfaces block and never fills `bit_depth`, `sample_rate` or an absent bitrate, because the probe is the only source of measured values. `alac` is the documented exception to the core's container set: the core has no ALAC container, so the key maps to `Container::M4aAac` and is reported as `lossless: false` — the stored bytes stay untouched and the probe of the real file decides what the database records. `mp3-128` is a real spec §8.2 key and is not "unknown": it is lossy MP3 at `Some(128)`.
 
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `cargo test --test bandcamp_download_chain`
-Expected: PASS, 11 tests.
+Expected: PASS, 13 tests.
 
 - [ ] **Step 6: Commit**
 
@@ -543,8 +612,8 @@ git commit -m "feat(bandcamp): statdownload chain and encoding selection"
   - `maxfetch::sources::bandcamp::ArchiveEntry` — `struct { member: String, path: PathBuf }`, `Clone + Debug + PartialEq`.
   - `maxfetch::sources::bandcamp::is_zip(path: &Path) -> anyhow::Result<bool>` — true when the first four bytes are `PK\x03\x04`.
   - `maxfetch::sources::bandcamp::unpack_archive(zip_path: &Path, dest: &Path) -> anyhow::Result<Vec<ArchiveEntry>>` — creates `dest`, extracts every file entry, skips directories, `__MACOSX/` prefixes and `.DS_Store`, and returns the entries sorted by member name.
-  - `maxfetch::sources::bandcamp::archive_dir(cache_root: &Path, tralbum_id: u64) -> PathBuf` — `<cache_root>/bandcamp/<tralbum_id>`; `archive_zip_path(cache_root: &Path, tralbum_id: u64) -> PathBuf` — `<archive_dir>/promo.zip`; `archive_members_dir(cache_root: &Path, tralbum_id: u64) -> PathBuf` — `<archive_dir>/members`.
-  - `maxfetch::sources::bandcamp::unpack_cached(zip_path: &Path, cache_root: &Path, tralbum_id: u64) -> anyhow::Result<Vec<ArchiveEntry>>` — extracts into `archive_members_dir` only when that directory is empty or missing, otherwise lists it again; the ZIP is read once per tralbum per run.
+  - `maxfetch::sources::bandcamp::archive_dir(cache_root: &Path, tralbum_id: u64) -> PathBuf` — `<cache_root>/bandcamp/<tralbum_id>`, the single key of the unpacked-archive cache; with the `BandcampSource::new` root this is `$XDG_CACHE_HOME/maxfetch/bandcamp/<tralbum_id>` (Task 5, Task 9). `archive_zip_path(cache_root: &Path, tralbum_id: u64) -> PathBuf` — `<archive_dir>/promo.zip`; `archive_members_dir(cache_root: &Path, tralbum_id: u64) -> PathBuf` — `<archive_dir>/members`. `archive_dir` creates nothing; the caller creates the directories it writes to.
+  - `maxfetch::sources::bandcamp::unpack_cached(zip_path: &Path, cache_root: &Path, tralbum_id: u64) -> anyhow::Result<Vec<ArchiveEntry>>` — extracts into `archive_members_dir` only when that directory is empty or missing, otherwise lists it again; the ZIP is read once per tralbum per run. Both `candidates` and `download` go through `archive_members_dir(cache_root, tralbum_id)`, which is why the tralbum id — not the page URL — is the address of an unpacked archive.
   - `maxfetch::sources::bandcamp::match_members_to_tracks(members: &[ArchiveEntry], tracks: &[BandcampTrack]) -> Vec<(ArchiveEntry, BandcampTrack)>` — first pass matches the sanitized member stem against the sanitized track title, second pass pairs the leftovers by position in both lists; unmatched members and unmatched tracks are dropped.
   - `maxfetch::sources::bandcamp::track_number_from_stem(stem: &str) -> Option<u32>` — leading digits of a member stem (`"01 Neon"` -> `Some(1)`).
 
@@ -697,19 +766,23 @@ git commit -m "feat(bandcamp): unpack promo archives into per-track candidates"
 
 **Files:**
 - Modify: `src/sources/bandcamp.rs`
-- Test: `tests/bandcamp_source.rs`
+- Modify: `tests/support/mod.rs` (the `tralbum_json` helper used by the 12-track fixtures is one-based, Task 2)
+- Test: `tests/bandcamp_source.rs` (14 tests; also add the `bandcamp_archive_written` file helper there)
 
 **Interfaces:**
 - Consumes: `maxfetch::sources::{Capabilities, AuthState, Query, QueryItem, Source}` and `maxfetch::fetch::ProgressSink` (core Task 10), `maxfetch::config::{Config, Credentials}` (core Task 3), everything from Tasks 1-4.
 - Produces:
   - `maxfetch::sources::bandcamp::PromoAvailability` — `enum { Free, PaidOnly, Unavailable }`, `Copy + Debug + PartialEq`, with `message(&self) -> &'static str` (`Free` -> `"бесплатное промо"`, the other two -> `"нет бесплатного промо"`) and `is_free(&self) -> bool`.
   - `maxfetch::sources::bandcamp::promo_availability(release: &BandcampRelease) -> PromoAvailability` — `Free` when `free_download` is true, `PaidOnly` when `is_purchasable || has_digital_download`, otherwise `Unavailable`.
-  - `maxfetch::sources::bandcamp::BandcampTarget` — `struct { request_url: String, member: Option<String>, encoding: String }`, `Debug + PartialEq`.
+  - `maxfetch::sources::bandcamp::BandcampTarget` — `struct { request_url: String, member: Option<String>, encoding: String, tralbum_id: Option<u64> }`, `Debug + PartialEq`.
   - `maxfetch::sources::bandcamp::make_member_locator(request_url: &str, member: &str, encoding: &str) -> Locator` — `Locator::Bandcamp { url: format!("{request_url}#{member}"), encoding: encoding.into() }`.
-  - `maxfetch::sources::bandcamp::parse_locator(loc: &Locator) -> Option<BandcampTarget>` — splits the fragment off and percent-decodes it; `None` for a non-Bandcamp locator.
+  - `maxfetch::sources::bandcamp::parse_locator(loc: &Locator) -> Option<BandcampTarget>` — splits the fragment off and percent-decodes it; `None` for a non-Bandcamp locator. `tralbum_id` is recovered from `request_url` **without extending `Locator`**, in this order: the `tralbum_id` query parameter, then `album_id`, then `id` (the `retry_url` shape `.../download/album?enc=flac&fsig=...&id=2814` carries the tralbum id in `id`). When none of the three is present, `tralbum_id` is `None` and `download` falls back to looking the member up by `encoding` + the member's track title inside the cache root: it walks `<cache_root>/bandcamp/*/members` and takes the first directory that holds a file whose stem, after the leading track number, matches the member stem. The archive itself is always keyed by `tralbum_id` (`archive_dir`), so this lookup only repairs a locator that lost the id; it never unpacks a second copy.
   - `maxfetch::sources::bandcamp::BandcampEndpoints` — `struct { api_base: String }`, `Clone + Debug`, with `BandcampEndpoints::production() -> BandcampEndpoints` (`https://bandcamp.com`).
-  - `maxfetch::sources::bandcamp::BandcampSource` with `BandcampSource::new(config: &Config, credentials: &Credentials) -> BandcampSource` and `BandcampSource::with_api_base(api_base: &str, cache_root: &Path) -> BandcampSource`.
-  - `impl Source for BandcampSource` — `id() -> SourceId::Bandcamp`; `capabilities() -> Capabilities { audio: true, metadata_only: false, lossless: true, needs_auth: false }`; `auth_state() -> AuthState::NotNeeded`; `search` maps a text query to `fuzzysearch` and resolves the first 5 album/track hits through `tralbum_details`; `resolve` turns a Bandcamp URL into its releases; `candidates` runs the promo chain and returns exactly one candidate per matched archive member; `download` copies the matched member (or the single-track file) into `dest`.
+  - `maxfetch::sources::bandcamp::BandcampSource` — constructors, all of them fixed by this task so Stage 2 reuses them without a conflict:
+    - `BandcampSource::new(config: &Config, credentials: &Credentials) -> BandcampSource` — production endpoints (`BandcampEndpoints::production()`), the shared `reqwest` client from `maxfetch::fetch::http_client`, and the archive cache root `$XDG_CACHE_HOME/maxfetch` (falling back to `$HOME/.cache/maxfetch` when `XDG_CACHE_HOME` is unset), created at construction time. `archive_dir` appends `bandcamp/<tralbum_id>`, so the unpacked archives live at `$XDG_CACHE_HOME/maxfetch/bandcamp/<tralbum_id>` and nowhere else. Nothing in `new` depends on `config::config_dir()` and nothing is read from `BandcampCredentials::identity_cookie`.
+    - `BandcampSource::with_api_base(api_base: &str, cache_root: &Path) -> BandcampSource` — `api_base` replaces the endpoint host and `cache_root` replaces the cache root verbatim (the test passes a `tempfile::tempdir()` path); used by every test in this stage.
+    - `BandcampSource::with_endpoints(endpoints: BandcampEndpoints, cache_root: &Path) -> BandcampSource` — the full form both of the above delegate to, for Stage 2 which needs a non-production `api_base` together with a chosen cache root.
+  - `impl Source for BandcampSource` — `id() -> SourceId::Bandcamp`; `capabilities() -> Capabilities { audio: true, metadata_only: false, lossless: true, needs_auth: false }`; `auth_state() -> AuthState::NotNeeded`; `search` maps a text query to `fuzzysearch` and resolves the first 5 album/track hits through `tralbum_details` using each hit's `band_id`; `resolve` turns an album/track URL into its releases through `tralbum_details` and an artist URL into one `Release` per discography entry (via `GET /api/mobile/24/band_details?band_id=`); `candidates` runs the promo chain and returns exactly one candidate per matched archive member; `download` copies the matched member (or the single-track file) into `dest`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -736,6 +809,10 @@ fn read(rel: &str) -> String {
 
 /// The recorded album page and the recorded statdownload body, both rewritten
 /// onto the mock server's own origin.
+/// The recorded album page, the recorded download page (403 "Download Expired"),
+/// the recorded statdownload body and the retry archive, all rewritten onto the
+/// mock server's own origin. The 403 route is what makes the test exercise the
+/// real §8.2 chain instead of skipping straight to the retry body.
 fn album_routes(album_page: &str, track_count: u32, zip: Option<Vec<u8>>) -> impl FnOnce(&str) -> Vec<Route> {
     let page = album_page.to_string();
     let tralbum = support::tralbum_json(track_count);
@@ -743,6 +820,7 @@ fn album_routes(album_page: &str, track_count: u32, zip: Option<Vec<u8>>) -> imp
     move |base: &str| {
         vec![
             Route::new(PAGE, vec![Reply::ok("text/html", page.replace("https://nightwave.bandcamp.com", base))]),
+            Route::new(&format!("{PAGE}/download"), vec![Reply::status(403, "Download Expired")]),
             Route::new(
                 &format!("{PAGE}/statdownload"),
                 vec![Reply::ok("text/plain", retry.replace("https://nightwave.bandcamp.com", base))],
@@ -765,6 +843,18 @@ fn promo_zip(track_count: u32) -> Vec<u8> {
 
 fn album_page() -> String {
     read("bandcamp/album_page.html")
+}
+
+/// True when the source unpacked something under the archive cache root.
+fn bandcamp_archive_written(cache_root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(cache_root) else { return false };
+    for entry in entries.flatten() {
+        let members = entry.path().join("members");
+        if std::fs::read_dir(&members).map(|d| d.count() > 0).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
 }
 
 #[test]
@@ -800,6 +890,19 @@ fn the_locator_carries_the_archive_member_in_the_fragment() {
     assert_eq!(target.request_url, "https://nightwave.bandcamp.com/download/album?enc=flac&fsig=abc");
     assert_eq!(target.member.as_deref(), Some("01 Track 1.flac"));
     assert_eq!(target.encoding, "flac");
+    assert_eq!(target.tralbum_id, None);
+}
+
+#[test]
+fn the_tralbum_id_is_recovered_from_the_retry_url_query() {
+    // The real `retry_url` shape: `.../download/album?enc=flac&fsig=...&id=2814`.
+    let retry = "https://nightwave.bandcamp.com/download/album?enc=flac&fsig=abc123&id=2814";
+    let target = parse_locator(&make_member_locator(retry, "01 Track 1.flac", "flac")).unwrap();
+    assert_eq!(target.tralbum_id, Some(2814));
+    let explicit = "https://nightwave.bandcamp.com/download/album?tralbum_id=2814&enc=flac";
+    assert_eq!(parse_locator(&make_member_locator(explicit, "01 Track 1.flac", "flac")).unwrap().tralbum_id, Some(2814));
+    let album = "https://nightwave.bandcamp.com/download/album?album_id=2814&enc=flac";
+    assert_eq!(parse_locator(&make_member_locator(album, "01 Track 1.flac", "flac")).unwrap().tralbum_id, Some(2814));
 }
 
 #[test]
@@ -825,7 +928,8 @@ async fn a_twelve_track_free_album_produces_one_candidate_per_track() {
 }
 
 #[tokio::test]
-async fn downloading_three_of_twelve_writes_three_files_and_fetches_the_zip_once() {
+async fn downloading_three_of_twelve_writes_exactly_those_three_and_fetches_the_zip_once() {
+    const WANTED: [u32; 3] = [1, 5, 12];
     let zip = promo_zip(12);
     let server = MockServer::start_with(album_routes(&album_page(), 12, Some(zip))).await;
     let cache = tempfile::tempdir().unwrap();
@@ -834,13 +938,37 @@ async fn downloading_three_of_twelve_writes_three_files_and_fetches_the_zip_once
     let tralbum = parse_tralbum_details(&support::tralbum_json(12)).unwrap();
     let releases = tralbum.to_releases(&format!("{}{}", server.base_url(), PAGE));
     let candidates = src.candidates(&releases[2]).await.unwrap();
+    assert_eq!(candidates.len(), 12);
 
-    for (i, candidate) in candidates.iter().take(3).enumerate() {
-        let dest = out.path().join(format!("{i}.flac"));
+    // Download tracks 1, 5 and 12 by their track number, not by position, so the
+    // test pins which members were written instead of taking whichever come first.
+    let mut written: Vec<String> = Vec::new();
+    for &n in &WANTED {
+        let candidate = candidates.iter().find(|c| c.release.track_no == Some(n)).unwrap();
+        let member = parse_locator(&candidate.locator).unwrap().member.unwrap();
+        let dest = out.path().join(&member);
         src.download(candidate, &dest, &NoopSink).await.unwrap();
         assert!(dest.exists());
+        written.push(member);
     }
-    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 3);
+    written.sort();
+    assert_eq!(written, vec!["01 Track 1.flac", "05 Track 5.flac", "12 Track 12.flac"]);
+
+    // The other nine members must not have produced a file.
+    let files: Vec<String> = std::fs::read_dir(out.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(files.len(), 3);
+    for n in (1..=12u32).filter(|n| !WANTED.contains(n)) {
+        let prefix = format!("{n:02} ");
+        assert!(!files.iter().any(|f| f.starts_with(&prefix)), "{prefix} was downloaded");
+    }
+
+    // One album, one archive: the promo chain and the ZIP are fetched once even
+    // though three candidates were written. `request_count` counts requests per
+    // path, so three downloads of `/download/album` would read as three.
+    assert_eq!(server.request_count(&format!("{PAGE}/download")), 1);
     assert_eq!(server.request_count(&format!("{PAGE}/statdownload")), 1);
     assert_eq!(server.request_count("/download/album"), 1);
 }
@@ -914,10 +1042,119 @@ async fn a_release_without_a_page_blob_reports_no_promo() {
         source: SourceId::Bandcamp,
         source_item_id: format!("{}{}|9001", server.base_url(), PAGE),
     };
-    assert!(src.candidates(&release).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_statdl_result_without_a_retry_url_reports_no_promo() {
+    let page = album_page();
+    let statdl = r#"var _statDL_result = {"result":"err","errortype":"ExpiredFreeDownloadError"};"#;
+    let server = MockServer::start_with(move |base: &str| {
+        vec![
+            Route::new(PAGE, vec![Reply::ok("text/html", page.replace("https://nightwave.bandcamp.com", base))]),
+            Route::new(&format!("{PAGE}/download"), vec![Reply::status(403, "Download Expired")]),
+            Route::new(&format!("{PAGE}/statdownload"), vec![Reply::ok("text/plain", statdl)]),
+            Route::new("/api/mobile/25/tralbum_details", vec![Reply::ok("application/json", support::tralbum_json(3))]),
+        ]
+    })
+    .await;
+    let cache = tempfile::tempdir().unwrap();
+    let src = BandcampSource::with_api_base(&server.base_url(), cache.path());
+    let tralbum = parse_tralbum_details(&support::tralbum_json(3)).unwrap();
+    let release = tralbum.to_releases(&format!("{}{}", server.base_url(), PAGE))[0].clone();
+
+    // No retry_url is «нет бесплатного промо», not an error and not a disabled source.
+    let candidates = src.candidates(&release).await.unwrap();
+    assert!(candidates.is_empty());
+    assert_eq!(src.auth_state(), AuthState::NotNeeded);
+    assert_eq!(server.request_count("/download/album"), 0);
+}
+
+#[tokio::test]
+async fn an_html_body_instead_of_a_zip_yields_no_candidates() {
+    let page = album_page();
+    let retry = read("bandcamp/statdownload_result.txt");
+    let server = MockServer::start_with(move |base: &str| {
+        vec![
+            Route::new(PAGE, vec![Reply::ok("text/html", page.replace("https://nightwave.bandcamp.com", base))]),
+            Route::new(&format!("{PAGE}/download"), vec![Reply::status(403, "Download Expired")]),
+            Route::new(
+                &format!("{PAGE}/statdownload"),
+                vec![Reply::ok("text/plain", retry.replace("https://nightwave.bandcamp.com", base))],
+            ),
+            // The retry URL answers with the download page instead of the archive.
+            Route::new("/download/album", vec![Reply::ok("text/html", "<html><body>Download</body></html>")]),
+            Route::new("/api/mobile/25/tralbum_details", vec![Reply::ok("application/json", support::tralbum_json(3))]),
+        ]
+    })
+    .await;
+    let cache = tempfile::tempdir().unwrap();
+    let src = BandcampSource::with_api_base(&server.base_url(), cache.path());
+    let tralbum = parse_tralbum_details(&support::tralbum_json(3)).unwrap();
+    let release = tralbum.to_releases(&format!("{}{}", server.base_url(), PAGE))[0].clone();
+
+    let candidates = src.candidates(&release).await.unwrap();
+    assert!(candidates.is_empty());
     assert_eq!(server.request_count(&format!("{PAGE}/statdownload")), 0);
+    assert!(!bandcamp_archive_written(cache.path()));
+}
+
+#[tokio::test]
+async fn an_unknown_encoding_skips_only_that_member() {
+    // A promo whose archive is an unknown encoding: every member is skipped with a
+    // reason, but the source itself still answers Ok with an empty list.
+    let page = album_page();
+    let retry = read("bandcamp/statdownload_result.txt").replace("enc=flac", "enc=bz2");
+    let zip = promo_zip(3);
+    let server = MockServer::start_with(move |base: &str| {
+        vec![
+            Route::new(PAGE, vec![Reply::ok("text/html", page.replace("https://nightwave.bandcamp.com", base))]),
+            Route::new(&format!("{PAGE}/download"), vec![Reply::status(403, "Download Expired")]),
+            Route::new(
+                &format!("{PAGE}/statdownload"),
+                vec![Reply::ok("text/plain", retry.replace("https://nightwave.bandcamp.com", base))],
+            ),
+            Route::new("/download/album", vec![Reply::status(200, zip.clone())]),
+            Route::new("/api/mobile/25/tralbum_details", vec![Reply::ok("application/json", support::tralbum_json(3))]),
+        ]
+    })
+    .await;
+    let cache = tempfile::tempdir().unwrap();
+    let src = BandcampSource::with_api_base(&server.base_url(), cache.path());
+    let tralbum = parse_tralbum_details(&support::tralbum_json(3)).unwrap();
+    let release = tralbum.to_releases(&format!("{}{}", server.base_url(), PAGE))[0].clone();
+
+    let candidates = src.candidates(&release).await.unwrap();
+    assert!(candidates.is_empty());
+}
+
+#[tokio::test]
+async fn an_artist_url_resolves_to_one_release_per_discography_item() {
+    let page = album_page();
+    let band_details = read("bandcamp/band_details.json");
+    let tralbum = support::tralbum_json(3);
+    let server = MockServer::start_with(move |base: &str| {
+        vec![
+            Route::new("/", vec![Reply::ok("text/html", page.replace("https://nightwave.bandcamp.com", base))]),
+            Route::new("/api/mobile/24/band_details", vec![Reply::ok("application/json", band_details.clone())]),
+            Route::new("/api/mobile/25/tralbum_details", vec![Reply::ok("application/json", tralbum.clone())]),
+        ]
+    })
+    .await;
+    let cache = tempfile::tempdir().unwrap();
+    let src = BandcampSource::with_api_base(&server.base_url(), cache.path());
+
+    let releases = src
+        .resolve(&maxfetch::sources::Query { text: None, url: Some(server.base_url()), items: vec![] })
+        .await
+        .unwrap();
+    // Two discography items, each resolved through tralbum_details into its tracks.
+    assert_eq!(releases.len(), 6);
+    assert_eq!(server.request_count("/api/mobile/24/band_details"), 1);
+    assert_eq!(server.request_count("/api/mobile/25/tralbum_details"), 2);
 }
 ```
+
+`bandcamp_archive_written` in the HTML-body test is a small file helper defined at the top of `tests/bandcamp_source.rs` (next to `promo_zip`, body shown above): it walks the cache root and returns true when any `bandcamp/*/members` directory holds a file. It keeps the assertion independent of the source's error type while pinning "nothing was unpacked from an HTML body". The artist test also needs `use maxfetch::sources::Query;` at the top of the file.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -930,20 +1167,25 @@ Expected: FAIL with "unresolved import `maxfetch::sources::bandcamp::BandcampSou
 1. `split_source_item_id(&release.source_item_id)` -> `(page_url, track_id)`; a malformed id is logged with `tracing::warn!` and returns `Ok(vec![])`.
 2. Fetch `page_url` and parse `parse_bandcamp_ids` -> `(band_id, tralbum_id)` and `parse_data_tralbum`. A page without ids or without a `data-tralbum` blob yields `Ok(vec![])` after logging «нет бесплатного промо» for the release.
 3. `GET {api_base}/api/mobile/25/tralbum_details?band_id=<id>&tralbum_id=<id>&tralbum_type=<a|t>` -> `parse_tralbum_details` -> `promo_availability`. When it is not `Free`, log `tracing::info!("{}: {} — {}", artist, title, availability.message())` and return `Ok(vec![])`.
-4. `free_download_page` -> `GET` -> when `is_expired_download(status, body)`, rewrite with `statdownload_url(url, nonce)` where `nonce = SystemTime::now()` subsec nanos, `GET` that -> `parse_statdownload_result` -> `retry_url`. A missing `retry_url` is logged with the same «нет бесплатного промо» message and returns `Ok(vec![])`. A first-pass success without a 403 uses the download page body directly.
-5. The retry body is written to `archive_zip_path(cache_root, tralbum_id)`; `is_zip` decides. A ZIP goes through `unpack_cached` + `match_members_to_tracks` (Task 4); a non-ZIP is the single-track file and becomes exactly one candidate whose locator has no member.
-6. `encoding = retry_encoding(&retry_url)`; `format_quality(&encoding)` gives the quality, and `None` means an unknown encoding: log `tracing::warn!` and skip that member. Each remaining `(member, track)` becomes one `Candidate { source: SourceId::Bandcamp, release: <track release>, quality, size_bytes: None, locator: make_member_locator(&retry_url, &member.member, &encoding) }`.
+4. `free_download_page` -> `GET` -> when the answer is the 403 `is_expired_download(status, body)`, rewrite with `statdownload_url(url, nonce)` where `nonce = SystemTime::now()` subsec nanos, `GET` that -> `parse_statdownload_result` -> `retry_url`. A missing `retry_url` — including a `_statDL_result` with `"result":"err"` and only an `errortype` — is logged with the same «нет бесплатного промо» message and returns `Ok(vec![])`; it is never an error. A first-pass success without a 403 uses the download page body directly.
+5. The retry body is written to `archive_zip_path(cache_root, tralbum_id)` and `is_zip` decides. The tralbum type from step 3 picks the branch:
+   - `tralbum_type == Album`: a ZIP goes through `unpack_cached` + `match_members_to_tracks` (Task 4). A body without the `PK\x03\x04` signature is **not** an archive: its bytes are discarded, `tracing::warn!` records «страница загрузки вернула не архив» with the release artist and title, nothing is unpacked into the cache, and the call returns `Ok(vec![])` — the members are marked unavailable, and the source keeps working for other releases.
+   - `tralbum_type == Track`: the body is the audio file itself (the real `/download/track` answer), so it becomes exactly one candidate whose locator has no member — a non-ZIP body here is not an error and does not raise the warning.
+6. `encoding = retry_encoding(&retry_url)`; `format_quality(&encoding)` gives the quality. `None` means the `enc` is outside `FREE_DOWNLOAD_FORMATS`: the member is dropped from the result, `tracing::warn!("неизвестный формат {} у трека {}", encoding, track.title)` records the user-facing reason «неизвестный формат <enc> у трека <title>», the skipped count for that reason is kept for the run report, and the remaining members still become candidates — one unknown member never empties the release. Each remaining `(member, track)` becomes one `Candidate { source: SourceId::Bandcamp, release: <track release>, quality, size_bytes: None, locator: make_member_locator(&retry_url, &member.member, &encoding) }`.
 
-`download` resolves `parse_locator`, and when `member` is `Some` it copies the cached member file to `dest` (re-fetching and unpacking the archive when the cache was cleaned between `candidates` and `download`), otherwise copies the single-track file; it finishes with `sink.on_finished(size)`. The archive is never unpacked twice for one tralbum: `unpack_cached` guards that, which is why three downloads of one album hit the network once.
+`download` resolves `parse_locator` and, when `member` is `Some`, copies the cached member file to `dest`. The cache directory is located by `target.tralbum_id` (`archive_members_dir(cache_root, id)`, with the `encoding` + member-title walk over `bandcamp/*/members` as the fallback when the locator lost the id); when the cache was cleaned between `candidates` and `download`, the archive is re-fetched from `target.request_url` and re-unpacked into that same directory. When `member` is `None` it copies the single-track file. It finishes with `sink.on_finished(size)`. The archive is never unpacked twice for one tralbum: `unpack_cached` guards that, which is why three downloads of one album hit the network once.
 
-`search` calls `{api_base}/api/fuzzysearch/2/app_autocomplete?q=<percent-encoded>&param_with_locations=true`, keeps the first 5 `Album`/`Track` hits, resolves each through `tralbum_details`, and returns the union of `to_releases`, deduplicated by `source_item_id`. An empty result is `Ok(vec![])`.
+`search` calls `{api_base}/api/fuzzysearch/2/app_autocomplete?q=<percent-encoded>&param_with_locations=true`, keeps the first 5 `Album`/`Track` hits, resolves each through `tralbum_details` with the hit's own `id` (`tralbum_id`) and `band_id` — a hit without a `band_id` cannot be resolved and is logged with `tracing::debug!` and skipped — and returns the union of `to_releases`, deduplicated by `source_item_id`. An empty result is `Ok(vec![])`.
 
-`resolve` accepts a `Query::url` for an album or track page: it fetches the page, parses the ids and the tralbum type from the path, then reuses the same `tralbum_details` path as `search`. An artist URL is not expanded in this stage (`search` covers discovery); it logs `tracing::info!("страница артиста: используйте поиск")` and returns `Ok(vec![])`.
+`resolve` handles three URL shapes of spec §8.2:
+- Album or track page: fetch the page, parse the ids and the tralbum type from the path, then reuse the same `tralbum_details` path as `search`.
+- Artist page (`classify_url` -> `Artist`): take the `band_id` from `parse_bandcamp_ids` of the fetched page (or from a `band_id=` query parameter when the URL carries one), `GET {api_base}/api/mobile/24/band_details?band_id=<id>` -> `parse_band_details` -> for each `DiscographyItem` issue the step-3 `tralbum_details` call with its `item_id`/`item_type` and collect `to_releases`. The result is the artist's discography, so §8.2 is reachable without `search`. A `band_details` failure or an empty discography logs `tracing::info!("дискография пуста: {}", url)` and returns `Ok(vec![])`.
+- Anything else logs `tracing::info!("неизвестная страница Bandcamp: {}", url)` and returns `Ok(vec![])`.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test --test bandcamp_source`
-Expected: PASS, 8 tests.
+Expected: PASS, 14 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -973,6 +1215,9 @@ git commit -m "feat(bandcamp): source implementation with promo candidates"
   - `maxfetch::sources::soundcloud::cached_client_id(dir: &Path) -> Option<String>` — `Credentials::load_from(dir).ok()?.soundcloud?.client_id`.
   - `maxfetch::sources::soundcloud::store_client_id(dir: &Path, client_id: &str) -> anyhow::Result<()>` — loads, sets `soundcloud.client_id` (creating the section when absent), saves through `Credentials::save_to`.
   - `maxfetch::sources::soundcloud::ensure_client_id(dir: &Path, client: &reqwest::Client, endpoints: &SoundCloudEndpoints) -> anyhow::Result<String>` — cached value when present, otherwise scrape + store.
+  - `maxfetch::sources::soundcloud::SoundCloudUser` — `struct { id: u64, username: String, permalink: String, followers_count: u64, city: Option<String>, country: Option<String> }`, `Clone + Debug + PartialEq`. This is the §8.9 `GET /users/{id}` profile that `yt-dlp` cannot give us.
+  - `maxfetch::sources::soundcloud::parse_user(json: &str) -> anyhow::Result<SoundCloudUser>` — reads `id`, `username`, `permalink`, `followers_count` (default `0` when absent), `city`, `country` (both optional); a missing `username` or `permalink` is an error naming the missing field.
+  - `maxfetch::sources::soundcloud::get_user(client: &reqwest::Client, endpoints: &SoundCloudEndpoints, client_id: &str, user_id: u64) -> anyhow::Result<SoundCloudUser>` — one `GET {api_base}/users/{user_id}?client_id={client_id}` -> `parse_user`. No retry here: the once-only re-scrape on 401/403 belongs to Task 8's `api_get`, which wraps this request shape for every endpoint.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -982,7 +1227,7 @@ mod support;
 
 use maxfetch::config::Credentials;
 use maxfetch::sources::soundcloud::{
-    cached_client_id, ensure_client_id, find_client_id, scrape_client_id, script_urls, store_client_id,
+    cached_client_id, ensure_client_id, find_client_id, get_user, scrape_client_id, script_urls, store_client_id,
     SoundCloudEndpoints,
 };
 use support::{fixture, MockServer, Reply, Route};
@@ -1075,6 +1320,25 @@ async fn a_cached_id_is_reused_without_touching_the_network() {
     assert_eq!(id, "iN5ffSanbMS4rYYxVJVZcQU5jdq8Fjmz");
     assert_eq!(server.request_count("/"), 0);
 }
+
+#[tokio::test]
+async fn the_artist_profile_is_read_from_the_users_endpoint() {
+    let server = MockServer::start(vec![
+        Route::new("/users/77", vec![Reply::ok("application/json", read("soundcloud/user.json"))]),
+    ])
+    .await;
+    let client = reqwest::Client::new();
+    let user = get_user(&client, &endpoints(&server.base_url()), "iN5ffSanbMS4rYYxVJVZcQU5jdq8Fjmz", 77)
+        .await
+        .unwrap();
+    assert_eq!(user.id, 77);
+    assert_eq!(user.username, "nightwave");
+    assert_eq!(user.permalink, "nightwave");
+    assert_eq!(user.followers_count, 18244);
+    assert_eq!(user.city.as_deref(), Some("Berlin"));
+    assert_eq!(user.country.as_deref(), Some("DE"));
+    assert_eq!(server.request_count("/users/77"), 1);
+}
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -1093,6 +1357,12 @@ Expected: FAIL with "unresolved import `maxfetch::sources::soundcloud`".
 ```
 `tests/fixtures/soundcloud/bundle_early.js`: `var env={api_key:"not-a-client-id",env:"production"};`
 `tests/fixtures/soundcloud/bundle_late.js`: `var cfg={client_id:"iN5ffSanbMS4rYYxVJVZcQU5jdq8Fjmz",env:"production",version:1789401};`
+`tests/fixtures/soundcloud/user.json` — the recorded `GET /users/77` body of the track owner:
+```json
+{"id":77,"username":"nightwave","permalink":"nightwave","followers_count":18244,
+ "city":"Berlin","country":"DE","description":"electronic music","track_count":42}
+```
+Only the five fields in `SoundCloudUser` are read; the rest is what the service really returns and must not affect the parser.
 
 - [ ] **Step 4: Implement the scraper**
 
@@ -1100,12 +1370,14 @@ Expected: FAIL with "unresolved import `maxfetch::sources::soundcloud`".
 
 `store_client_id` loads the credentials, replaces the `[soundcloud]` section (preserving `oauth_token` when it was there) and saves. The file keeps mode 0600 because it always goes through `Credentials::save_to`.
 
+`parse_user` and `get_user` are the §8.9 profile path: `get_user` issues exactly one `GET {api_base}/users/{user_id}?client_id={client_id}` (no retry, no scrape), `parse_user` maps the five fields and defaults `followers_count` to `0` while keeping `city`/`country` optional. Task 8 reuses the same request shape through `api_get`, so the 401/403 re-scrape is implemented once.
+
 - [ ] **Step 5: Declare the module and run the test**
 
 Add `pub mod soundcloud;` to `src/sources/mod.rs`.
 
 Run: `cargo test --test soundcloud_client_id`
-Expected: PASS, 8 tests.
+Expected: PASS, 9 tests.
 
 - [ ] **Step 6: Commit**
 
@@ -1119,7 +1391,7 @@ git commit -m "feat(soundcloud): scrape and cache the public client_id"
 ### Task 7: SoundCloud metadata, ISRC and format classification
 
 **Files:**
-- Create: `tests/fixtures/soundcloud/track.json`, `tests/fixtures/soundcloud/track_progressive.json`
+- Create: `tests/fixtures/soundcloud/track.json`, `tests/fixtures/soundcloud/track_progressive.json`, `tests/fixtures/soundcloud/user.json`
 - Modify: `src/sources/soundcloud.rs`
 - Test: `tests/soundcloud_catalog.rs`
 
@@ -1290,6 +1562,8 @@ Expected: FAIL with "cannot find function `parse_track`".
 
 Note on `AudioFormat::quality()`: the `Flac` container for `protocol == "progressive"` is provisional and documented as such in a doc comment. The pipeline replaces it with the probed quality before anything is stored, and Task 9 asserts that the database row carries the probed container, never this provisional one.
 
+The profile endpoint of §8.9 is implemented here as `parse_user`/`get_user` (Task 7), and Task 8's `resolve` calls the same request through `api_get` so a rotated `client_id` is re-scraped for a profile read exactly as it is for a track read. `SoundCloudUser` stays a catalog detail in this stage: it is what the Sources/Track screen shows for the artist, and it never overrides `SoundCloudTrack::to_release`'s `artist`, because the track's own `publisher_metadata.artist` is closer to the recording than the account name.
+
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `cargo test --test soundcloud_catalog`
@@ -1388,6 +1662,7 @@ fn ytdlp_ids_are_read_from_both_shapes() {
 async fn a_track_id_yields_one_release_with_its_isrc() {
     let server = MockServer::start(vec![
         Route::new("/tracks/880017", vec![Reply::ok("application/json", read("soundcloud/track.json"))]),
+        Route::new("/users/77", vec![Reply::ok("application/json", read("soundcloud/user.json"))]),
         Route::new("/", vec![Reply::ok("text/html", read("soundcloud/home.html"))]),
         Route::new("/assets/50-late.js", vec![Reply::ok("application/javascript", read("soundcloud/bundle_late.js"))]),
     ])
@@ -1406,6 +1681,7 @@ async fn a_rotated_client_id_is_rescraped_and_the_request_retried_once() {
             Reply::status(401, "unauthorized"),
             Reply::ok("application/json", read("soundcloud/track.json")),
         ]),
+        Route::new("/users/77", vec![Reply::ok("application/json", read("soundcloud/user.json"))]),
         Route::new("/", vec![Reply::ok("text/html", read("soundcloud/home.html"))]),
         Route::new("/assets/50-late.js", vec![Reply::ok("application/javascript", read("soundcloud/bundle_late.js"))]),
     ])
@@ -1437,6 +1713,7 @@ async fn a_second_401_fails_the_request_without_a_panic() {
 async fn the_only_candidate_is_the_lossy_aac_stream() {
     let server = MockServer::start(vec![
         Route::new("/tracks/880017", vec![Reply::ok("application/json", read("soundcloud/track.json"))]),
+        Route::new("/users/77", vec![Reply::ok("application/json", read("soundcloud/user.json"))]),
         Route::new("/", vec![Reply::ok("text/html", read("soundcloud/home.html"))]),
         Route::new("/assets/50-late.js", vec![Reply::ok("application/javascript", read("soundcloud/bundle_late.js"))]),
     ])
@@ -1444,18 +1721,25 @@ async fn the_only_candidate_is_the_lossy_aac_stream() {
     let dir = tempfile::tempdir().unwrap();
     let src = SoundCloudSource::with_endpoints(endpoints(&server.base_url()), dir.path(), "yt-dlp");
     let release = src.resolve(&Query { text: None, url: None, items: vec![maxfetch::sources::QueryItem::Track { source: SourceId::SoundCloud, id: "880017".into() }] }).await.unwrap()[0].clone();
+    assert_eq!(server.request_count("/users/77"), 1, "the §8.9 profile is fetched during resolve");
     let candidates = src.candidates(&release).await.unwrap();
+    // Exactly one candidate, and it is lossy: no lossless stream is offered here.
     assert_eq!(candidates.len(), 1);
-    assert!(!candidates[0].quality.lossless);
+    assert!(candidates.iter().all(|c| !c.quality.lossless));
     assert_eq!(candidates[0].quality.container, Container::M4aAac);
     assert_eq!(candidates[0].quality.bitrate_kbps, Some(160));
     assert_eq!(candidates[0].locator, Locator::SoundCloud { track_id: "880017".into() });
+    // The platform's lossless claim must not leak into the catalog: the track is
+    // downloadable and flagged as such on SoundCloud, yet no lossless quality is
+    // produced and the release carries no lossless marker.
+    assert!(release.isrc.as_deref() == Some("DEP960300042"));
 }
 
 #[tokio::test]
 async fn a_lossy_download_goes_through_ytdlp_with_the_hls_preset() {
     let server = MockServer::start(vec![
         Route::new("/tracks/880017", vec![Reply::ok("application/json", read("soundcloud/track.json"))]),
+        Route::new("/users/77", vec![Reply::ok("application/json", read("soundcloud/user.json"))]),
         Route::new("/", vec![Reply::ok("text/html", read("soundcloud/home.html"))]),
         Route::new("/assets/50-late.js", vec![Reply::ok("application/javascript", read("soundcloud/bundle_late.js"))]),
     ])
@@ -1484,21 +1768,20 @@ async fn a_source_with_an_oauth_token_advertises_lossless() {
 }
 ```
 
-Before running, add the stub script `tests/fixtures/bin/fake-yt-dlp.sh` (Step 3) and make it executable. The last test's `Config`/`SoundCloudCredentials` come from `maxfetch::config` (core Task 3); the `Credentials::soundcloud` field type is `Option<SoundCloudCredentials>{ client_id: Option<String>, oauth_token: Option<String> }`.
+Before running, add the stub scripts `tests/fixtures/bin/fake-yt-dlp.sh` and `tests/fixtures/bin/fake-yt-dlp-lossy.sh` (Step 3) and make them executable. The last test's `Config`/`SoundCloudCredentials` come from `maxfetch::config` (core Task 3); the `Credentials::soundcloud` field type is `Option<SoundCloudCredentials>{ client_id: Option<String>, oauth_token: Option<String> }`.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test --test soundcloud_source`
 Expected: FAIL with "unresolved import `maxfetch::sources::soundcloud::classify_input`".
 
-- [ ] **Step 3: Create the yt-dlp stub and its recorded payloads**
+- [ ] **Step 3: Create the yt-dlp stubs and their recorded payloads**
 
-`tests/fixtures/bin/fake-yt-dlp.sh`:
+`tests/fixtures/bin/fake-yt-dlp.sh` — the metadata stub used by Task 8 (prints the JSON, and would copy a FLAC only if asked to download, which Task 8 never does):
 ```bash
 #!/bin/sh
 # Replays a recorded yt-dlp result. The last argument is the target; -f selects
-# the format. Prints the JSON fixture to stdout and, for a download, copies a
-# real FLAC over the -o path.
+# the format. Prints the JSON fixture to stdout.
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -f) FORMAT="$2"; shift 2 ;;
@@ -1506,17 +1789,31 @@ while [ "$#" -gt 0 ]; do
     *) TARGET="$1"; shift ;;
   esac
 done
-if [ -n "$OUT" ]; then
-  cp "$(dirname "$0")/../probe/sine_44100_s16.flac" "$OUT"
-  exit 0
-fi
 if [ "$TARGET" = "scsearch10:nightwave neon" ]; then
   cat "$(dirname "$0")/yt-dlp-search.json"
 else
   cat "$(dirname "$0")/yt-dlp-url.json"
 fi
 ```
-`chmod +x tests/fixtures/bin/fake-yt-dlp.sh`.
+
+`tests/fixtures/bin/fake-yt-dlp-lossy.sh` — the download stub used by the Stage 1b pipeline test, which must deliver a **lossy** file so the probe and the `maxfetch: source=lossy` comment tell the truth about a SoundCloud AAC download:
+```bash
+#!/bin/sh
+# Delivers a real lossy file: an MP3 128 kbps, never a FLAC.
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+cp "$(dirname "$0")/../probe/sine_128k.mp3" "$OUT"
+```
+`chmod +x tests/fixtures/bin/fake-yt-dlp.sh tests/fixtures/bin/fake-yt-dlp-lossy.sh`.
+
+`tests/fixtures/probe/sine_128k.mp3` — generated once, committed (the command is in the Step below that needs it):
+```bash
+ffmpeg -f lavfi -i "sine=frequency=440:duration=1" -c:a libmp3lame -b:a 128k tests/fixtures/probe/sine_128k.mp3 -y
+```
 
 `tests/fixtures/bin/yt-dlp-url.json`:
 ```json
@@ -1531,7 +1828,7 @@ fi
 
 `api_get` builds `{api_base}{path}?client_id={id}` (with `&client_id=` when the path already carries a query), reads the status, and on 401/403 runs `ensure_client_id` with `force: true` semantics by calling `scrape_client_id` directly, then `store_client_id`, then repeats the request exactly once.
 
-`resolve` handles `QueryItem::Track { id }` by calling `api_get("/tracks/{id}")` -> `parse_track` -> `to_release`. A `Query::url` or a `QueryItem::Album/Playlist` goes through `yt-dlp -J --flat-playlist <url>` -> `parse_ytdlp_ids` -> one `api_get` per id. `Query::text` goes through `yt-dlp -J --flat-playlist "scsearch10:<text>"` -> `parse_ytdlp_ids` -> one `api_get` per id. Any `yt-dlp` failure is logged with `tracing::warn!` and yields `Ok(vec![])`, so a missing or broken `yt-dlp` never aborts a run.
+`resolve` handles `QueryItem::Track { id }` by calling `api_get("/tracks/{id}")` -> `parse_track` -> `to_release`. After the track is parsed, `resolve` also fetches its artist profile with `api_get("/users/{track.user_id}")` -> `parse_user` and keeps the result on the source for the Sources/Track screen (§8.9 `GET /users/{id}`); a profile failure is logged with `tracing::debug!` and never fails the resolve, because the profile is enrichment, not a prerequisite. A `Query::url` or a `QueryItem::Album/Playlist` goes through `yt-dlp -J --flat-playlist <url>` -> `parse_ytdlp_ids` -> one `api_get` per id. `Query::text` goes through `yt-dlp -J --flat-playlist "scsearch10:<text>"` -> `parse_ytdlp_ids` -> one `api_get` per id. Any `yt-dlp` failure is logged with `tracing::warn!` and yields `Ok(vec![])`, so a missing or broken `yt-dlp` never aborts a run.
 
 `candidates` re-fetches `GET /tracks/{id}` (the locator carries only the track id) and returns one candidate from `AudioFormat::pick`, with `size_bytes: None` (SoundCloud reports no size before the transfer) and `locator: Locator::SoundCloud { track_id }`.
 
@@ -1540,7 +1837,7 @@ fi
 - [ ] **Step 5: Run the test to verify it passes**
 
 Run: `cargo test --test soundcloud_source`
-Expected: PASS, 11 tests.
+Expected: PASS, 12 tests.
 
 - [ ] **Step 6: Commit**
 
@@ -1559,11 +1856,14 @@ git commit -m "feat(soundcloud): source with client_id retry and lossy download"
 - Test: `tests/stage1b_pipeline.rs`, `tests/stage1b_auth.rs`
 
 **Interfaces:**
-- Consumes: `maxfetch::pipeline::Pipeline` (core Task 11), `maxfetch::db::Db` (core Task 4), `maxfetch::sources::{registry, enabled_in, SourceStatus}` (core Task 10), `BandcampSource` (Task 5), `SoundCloudSource` (Task 8).
+- Consumes: `maxfetch::pipeline::Pipeline` (core Task 11), `maxfetch::db::Db` (core Task 4), `maxfetch::sources::{registry, enabled_in, SourceStatus}` (core Task 10 and stage 1 Task 7), `BandcampSource` (Task 5), `SoundCloudSource` (Task 8).
 - Produces:
-  - `maxfetch::sources::registry(config: &Config, credentials: &Credentials) -> Vec<Box<dyn Source>>` — unchanged signature; it now returns `BandcampSource` when `enabled_in(config, SourceId::Bandcamp)` and `SoundCloudSource` when `enabled_in(config, SourceId::SoundCloud)`, in that order.
+  - `maxfetch::sources::registry(config: &Config, credentials: &Credentials) -> Vec<Box<dyn Source>>` — unchanged signature, and the contract of the core and the stage 1 plan: **it returns every implemented source, unfiltered**, in the fixed order `Soulseek, YouTube, Spotify, Bandcamp, SoundCloud`, and never looks at `config.sources.enabled`. It only builds the two Stage 1b sources, appending `Bandcamp` then `SoundCloud` to what stage 1 already registers.
+  - `maxfetch::sources::enabled_in(ids: &[SourceId], config: &Config) -> Vec<SourceId>` — the single filter that the pipeline and the TUI apply on the registry output (stage 1 Task 7 owns it; this task does not redefine it, it only relies on it). A source that is registered but not enabled stays visible in the Sources screen and does not participate in a run.
+  - `maxfetch::sources::BandcampSource::new` passes the archive cache root `$XDG_CACHE_HOME/maxfetch` (falling back to `$HOME/.cache/maxfetch` when `XDG_CACHE_HOME` is unset), created at construction; `archive_dir` appends `bandcamp/<tralbum_id>`, so unpacked archives live exactly at `$XDG_CACHE_HOME/maxfetch/bandcamp/<tralbum_id>`. `SoundCloudSource::new` keeps using `config::config_dir()` for the `client_id` cache.
   - `maxfetch::auth::stage1b_login_hint(source: &str) -> Option<&'static str>` — `Some("вход в Bandcamp появится в этапе 2: в этапе 1б доступно только бесплатное промо")` for `"bandcamp"`, `Some("вход в SoundCloud появится в этапе 2: без него доступен только AAC 160k")` for `"soundcloud"`, `None` otherwise.
   - `maxfetch::auth::login` gains those two branches before the generic "not implemented in the core build" error, so `maxfetch auth login soundcloud` explains the limitation in Russian instead of claiming the build is incomplete.
+  - `maxfetch::cli::fetch_query` wiring for the §7.12 flags (core Task 13 already declares the flags; this task gives them meaning for the Stage 1b sources): `--page <url>` becomes `Query { text: None, url: Some(url), items: vec![] }` and the pipeline picks the source by the URL's domain — a `bandcamp.com` host routes to `Query::url` for `BandcampSource`, a `soundcloud.com` host routes to `Query::url` for `SoundCloudSource`; a host that matches neither is logged with `tracing::warn!` and the run gets an empty result instead of an error. `--soundcloud <url>` is the explicit form: it always targets `SoundCloudSource` (a bare `soundcloud.com` URL works even when the domain sniffing would be ambiguous, e.g. a `sndcdn.com` link).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1572,14 +1872,21 @@ Create `tests/stage1b_auth.rs`:
 use maxfetch::auth::{auth_status, login, stage1b_login_hint};
 use maxfetch::config::{Config, Credentials};
 use maxfetch::model::SourceId;
-use maxfetch::sources::registry;
+use maxfetch::sources::{enabled_in, registry};
 
 #[test]
-fn stage1b_sources_are_disabled_by_the_default_config() {
+fn stage1b_sources_are_registered_but_disabled_by_the_default_config() {
     let cfg = Config::default();
-    let ids: Vec<SourceId> = registry(&cfg, &Credentials::default()).iter().map(|s| s.id()).collect();
+    let all = registry(&cfg, &Credentials::default());
+    let ids: Vec<SourceId> = all.iter().map(|s| s.id()).collect();
+    // `registry` is a pure constructor: every implemented source is present,
+    // whatever `config.sources.enabled` says.
     assert!(ids.contains(&SourceId::Bandcamp));
-    assert!(!ids.contains(&SourceId::SoundCloud));
+    assert!(ids.contains(&SourceId::SoundCloud));
+    // `enabled_in` is the only filter; with the default config SoundCloud is off.
+    let enabled = enabled_in(&ids, &cfg);
+    assert!(enabled.contains(&SourceId::Bandcamp));
+    assert!(!enabled.contains(&SourceId::SoundCloud));
 }
 
 #[test]
@@ -1587,7 +1894,11 @@ fn an_enabled_soundcloud_is_registered() {
     let mut cfg = Config::default();
     cfg.sources.enabled.push("soundcloud".into());
     let ids: Vec<SourceId> = registry(&cfg, &Credentials::default()).iter().map(|s| s.id()).collect();
-    assert_eq!(ids, vec![SourceId::Bandcamp, SourceId::SoundCloud]);
+    assert!(ids.contains(&SourceId::Bandcamp));
+    assert!(ids.contains(&SourceId::SoundCloud));
+    let enabled = enabled_in(&ids, &cfg);
+    assert!(enabled.contains(&SourceId::Bandcamp));
+    assert!(enabled.contains(&SourceId::SoundCloud));
 }
 
 #[test]
@@ -1695,6 +2006,7 @@ async fn a_bandcamp_flac_wins_over_a_soundcloud_aac_track() {
 async fn a_soundcloud_only_run_records_an_honest_lossy_track() {
     let server = MockServer::start(vec![
         Route::new("/tracks/880017", vec![Reply::ok("application/json", read("soundcloud/track.json"))]),
+        Route::new("/users/77", vec![Reply::ok("application/json", read("soundcloud/user.json"))]),
         Route::new("/", vec![Reply::ok("text/html", read("soundcloud/home.html"))]),
         Route::new("/assets/50-late.js", vec![Reply::ok("application/javascript", read("soundcloud/bundle_late.js"))]),
     ])
@@ -1702,7 +2014,7 @@ async fn a_soundcloud_only_run_records_an_honest_lossy_track() {
     let lib = tempfile::tempdir().unwrap();
     let mut cfg = Config::default();
     cfg.library.path = lib.path().to_path_buf();
-    cfg.youtube.yt_dlp_path = fixture("bin/fake-yt-dlp.sh").to_str().unwrap().to_string();
+    cfg.youtube.yt_dlp_path = fixture("bin/fake-yt-dlp-lossy.sh").to_str().unwrap().to_string();
     let soundcloud = SoundCloudSource::with_endpoints(
         SoundCloudEndpoints { web_base: server.base_url(), api_base: server.base_url(), script_base: server.base_url() },
         lib.path(),
@@ -1720,23 +2032,27 @@ async fn a_soundcloud_only_run_records_an_honest_lossy_track() {
     assert!(!result.rejected);
     let tracks = p.db().all_tracks().unwrap();
     assert_eq!(tracks[0].isrc.as_deref(), Some("DEP960300042"));
+    assert!(!tracks[0].lossless, "the measured bytes are lossy");
     let comment = maxfetch::tags::read_tags(std::path::Path::new(&tracks[0].path)).unwrap().quality_comment;
     assert!(comment.contains("source=lossy"));
+    assert!(!comment.contains("source=lossless"));
 }
 ```
 
-The second test's stub writes a real FLAC under whatever name `yt-dlp -o` is given, so the probe reports the truth about the bytes and the pipeline stores the probed quality, not the AAC claim. That is the point: assert only that the candidate was classified lossy before the transfer (`!candidates[0].quality.lossless`), that the run is not rejected, and that the `maxfetch: source=lossy` comment is written. Do not assert `tracks[0].lossless` or the container here — the stub's bytes are FLAC, so the measured quality is what decides, exactly as a real MP3-from-SoundCloud would.
+The stub delivers a **real lossy file**: `tests/fixtures/bin/fake-yt-dlp-lossy.sh` copies `tests/fixtures/probe/sine_128k.mp3` (generated above) over the `-o` path, so the probe measures an actual MP3 128 kbps and the pipeline records `lossless = false` plus the `maxfetch: source=lossy` comment from measured bytes — exactly what a real SoundCloud AAC download produces. A stub writing FLAC bytes would have flipped the stored quality to the measured lossless (the probe decides) and made the comment assertion meaningless.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test --test stage1b_auth --test stage1b_pipeline`
 Expected: FAIL with "cannot find function `stage1b_login_hint`" and with `registry` returning no Bandcamp source.
 
-- [ ] **Step 3: Wire the registry and the auth status**
+- [ ] **Step 3: Wire the registry, the auth status and the CLI flags**
 
-In `src/sources/mod.rs`, replace the empty `registry` body: build the `Vec<Box<dyn Source>>` in the order `Bandcamp`, `SoundCloud`, each gated on `enabled_in`. `BandcampSource::new(config, credentials)` uses `config::config_dir()`-independent defaults, `SoundCloudSource::new(config, credentials)` uses `config::config_dir()` for the client-id cache.
+In `src/sources/mod.rs`, replace the empty `registry` body: push `BandcampSource::new(config, credentials)` and then `SoundCloudSource::new(config, credentials)`, **unconditionally**, after the three stage-1 sources. `registry` stays a pure constructor and does not call `enabled_in`; the pipeline and the TUI filter its output through `enabled_in(&ids, config)`, which is why a disabled source still shows up in the Sources screen with its reason. `BandcampSource::new` builds the cache root `$XDG_CACHE_HOME/maxfetch` (created at construction) — never `config::config_dir()`, which is where only `SoundCloudSource::new` looks for the cached `client_id`.
 
 In `src/auth.rs`, `auth_status` special-cases the two Stage 1b ids: `AuthState::NotNeeded` with the Russian detail strings from the Interfaces block, regardless of the credentials section. `login` checks `stage1b_login_hint` first and returns that message as the error.
+
+In `src/cli.rs`, give the two §7.12 flags their Stage 1b meaning: `Command::Fetch { page: Some(url), .. }` builds `Query { text: None, url: Some(url), items: vec![] }` and routes it to the source whose domain matches (`bandcamp.com` -> `BandcampSource`, `soundcloud.com` -> `SoundCloudSource`); `Command::Fetch { soundcloud: Some(url), .. }` builds the same `Query` but always targets `SoundCloudSource`. Neither flag bypasses `enabled_in`: a source disabled in the config is skipped with the log line from stage 1, so the flags select a source, they do not enable one.
 
 - [ ] **Step 4: Declare nothing new and run the tests**
 
@@ -1745,12 +2061,19 @@ No module declaration changes: both modules were declared in Tasks 1 and 6.
 Run: `cargo test --test stage1b_auth --test stage1b_pipeline`
 Expected: PASS, 4 and 2 tests.
 
-- [ ] **Step 5: Run the whole suite**
+- [ ] **Step 5: Add the Stage 1b end-to-end test**
+
+Spec §10 requires an e2e test per source behind `--features e2e`. Create `tests/e2e_stage1b.rs` starting with `#![cfg(feature = "e2e")]`, reusing `tests/support/mod.rs` (the module is compiled in this file too, so `mod support;` sits after the `cfg` attribute and the whole file is inert without the feature). The single test `bandcamp_promo_roundtrip_records_a_lossless_track` drives the whole Stage 1b Bandcamp path against the mock server: `fuzzysearch` -> `tralbum_details` -> the 403 `download` -> `statdownload` -> the retry archive, then `Pipeline::download` writes the file into a temporary library and `library scan` indexes it. Assert the indexed row is lossless, `source == SourceId::Bandcamp`, and ends in `.flac`. Seed the `e2e` feature in `Cargo.toml` (`[features] e2e = []`) if the core plan did not already add it; that one-line entry is the only `Cargo.toml` change in this task.
+
+Run: `cargo test --features e2e --test e2e_stage1b`
+Expected: PASS, 1 test. Without the feature the file compiles to nothing and `cargo test` is unaffected.
+
+- [ ] **Step 6: Run the whole suite**
 
 Run: `cargo test`
 Expected: every test passes, including the core suite from the core plan.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add -A
