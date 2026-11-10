@@ -306,10 +306,22 @@ impl Credentials {
     }
 
     pub fn save_to(&self, dir: &Path) -> anyhow::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
         fs::create_dir_all(dir)?;
         let path = dir.join("credentials.toml");
         let raw = toml::to_string_pretty(self)?;
-        fs::write(&path, raw)?;
+        // Create with 0600 from the start so secrets are never world-readable,
+        // even briefly under a permissive umask.
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(raw.as_bytes())?;
+        // Tighten pre-existing files that were created with loose permissions.
         ensure_private(&path)?;
         Ok(())
     }
