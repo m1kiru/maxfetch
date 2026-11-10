@@ -209,6 +209,7 @@ git commit -m "feat(qobuz): app credential scraping and format ladder"
 
 **Files:**
 - Modify: `src/sources/qobuz.rs`
+- Use: `tests/fixtures/probe/sine_44100_s16.flac` (the FLAC fixture generated and committed by core Task 6; this task only reads it, it creates no new fixture file)
 - Test: `tests/qobuz_source.rs`
 
 **Interfaces:**
@@ -1164,6 +1165,7 @@ git commit -m "feat(bandcamp): identity cookie and purchase lookup"
 **Files:**
 - Modify: `src/sources/bandcamp.rs`
 - Create: `tests/fixtures/bandcamp/download_page.html`
+- Use: `tests/fixtures/probe/sine_44100_s16.flac` (the FLAC fixture generated and committed by core Task 6; this task only reads it, it creates no new fixture file)
 - Test: `tests/bandcamp_redownload.rs`
 
 **Interfaces:**
@@ -1451,6 +1453,7 @@ git commit -m "feat(bandcamp): redownload formats, pagedata and album zip unpack
 - Create: `tests/fixtures/soundcloud/track_lossless.json`
 - Create: `tests/fixtures/soundcloud/ytdlp_original.json`
 - Create: `tests/fixtures/soundcloud/fake_ytdlp.sh`
+- Use: `tests/fixtures/probe/sine_44100_s16.flac` (the FLAC fixture generated and committed by core Task 6; the fake `yt-dlp` stub copies it over the `-o` path, this task creates no new fixture file)
 - Test: `tests/soundcloud_original.rs`
 
 **Interfaces:**
@@ -1655,8 +1658,8 @@ Expected: FAIL with "no function or associated item named `parse_ytdlp_json`".
 Run: `cargo test --test soundcloud_original`
 Expected: PASS, 7 tests.
 
-Run: `cargo test --test soundcloud`
-Expected: PASS, 7 tests. The stage 1b suite is untouched in behaviour. §7.4 is now stated explicitly (no open decision): lossy candidates are dropped from the ranked list whenever a lossless alternative exists, so the stage 1b `the_only_candidate_is_the_lossy_aac_stream` test keeps `ranked.len() == 1` for a track that has **no** original; a track that has both yields `ranked.len() == 1` too, holding only the original. The AAC candidate survives as a separate entry in the candidate list and in the database (`lossless = false`), but never in the auto-select ranked list. If a stage 1b test asserted that a both-stream track's ranked list had two entries, that assertion is wrong under §7.4 and is corrected to `ranked.len() == 1` with the original first.
+Run: `cargo test --test soundcloud_source`
+Expected: PASS, 11 tests. The stage 1b suite is untouched in behaviour. §7.4 is now stated explicitly (no open decision): lossy candidates are dropped from the ranked list whenever a lossless alternative exists, so the stage 1b `the_only_candidate_is_the_lossy_aac_stream` test keeps `ranked.len() == 1` for a track that has **no** original; a track that has both yields `ranked.len() == 1` too, holding only the original. The AAC candidate survives as a separate entry in the candidate list and in the database (`lossless = false`), but never in the auto-select ranked list. If a stage 1b test asserted that a both-stream track's ranked list had two entries, that assertion is wrong under §7.4 and is corrected to `ranked.len() == 1` with the original first.
 
 - [ ] **Step 5: Commit**
 
@@ -1675,17 +1678,18 @@ git commit -m "feat(soundcloud): oauth original file ranked above the aac transc
 - Modify: `src/auth.rs`
 - Modify: `src/tui/app.rs`
 - Create: `tests/e2e_stage2.rs`
+- Use: `tests/fixtures/probe/sine_44100_s16.flac` (the FLAC fixture generated and committed by core Task 6; the mock server serves it as the audio body, this task creates no new fixture file)
 - Test: `tests/stage2_end_to_end.rs`
 
 **Interfaces:**
-- Consumes: `QobuzSource` (Task 2), `SpotifySource::{mode, reauth_hint, auth_state}` (Tasks 4-5), `BandcampSource::{purchase_state, lookup_purchases, search}` (Tasks 6-7 and stage 1b), `SoundCloudSource::{original_download, original_candidate, aac_candidate}` (Task 8), `maxfetch::sources::{AuthState, Capabilities, Query, Source, SourceStatus, registry, enabled_in}`, `maxfetch::pipeline::Pipeline` (`source_statuses()` from core Task 11), `maxfetch::tui::App`.
+- Consumes: `QobuzSource` (Task 2), `SpotifySource::{mode, reauth_hint, auth_state}` (Tasks 4-5), `BandcampSource::{purchase_state, lookup_purchases, search}` (Tasks 6-7 and stage 1b), `SoundCloudSource::{original_download, original_candidate, aac_candidate}` (Task 8), `maxfetch::sources::{AuthState, Capabilities, Query, Source, SourceStatus, registry, enabled_in, is_enabled}`, `maxfetch::pipeline::Pipeline` (`source_statuses()` from core Task 11), `maxfetch::tui::App`.
 - Produces:
   - `maxfetch::sources::Source::status(&self) -> SourceStatus` — a defaulted trait method: `SourceStatus { id: self.id(), capabilities: self.capabilities(), auth: self.auth_state(), detail: None }`. Sources that have something to say (Qobuz, Bandcamp, SoundCloud, Spotify) override it in their own `impl Source` (never with an inherent method of the same name — see Task 2, item H).
   - `maxfetch::sources::source_statuses(sources: &[Box<dyn Source>]) -> Vec<SourceStatus>` — maps the slice through `status()` in registry order.
-  - **`registry` returns every registered source, unfiltered (canonical core contract, core Task 10).** `registry(config, credentials)` returns one boxed source per *implemented* source id, without consulting `config.sources.enabled` and without consulting credentials. Filtering is `enabled_in(config: &Config, id: SourceId) -> bool` (core Task 10), and it is the caller — `Pipeline` and the TUI — that applies it. A source whose section is missing is still registered (its `auth_state()` is `Missing`) so the user can see why it does nothing; the registry never hides it. There is no third filtering variant, in particular no "credential presence" filter inside `registry`; the old draft that filtered on `credentials.qobuz.is_some()` is removed.
+  - **`registry` returns every registered source, unfiltered (canonical core contract, core Task 10).** `registry(config, credentials)` returns one boxed source per *implemented* source id, without consulting `config.sources.enabled` and without consulting credentials. Filtering is done by the core Task 10 pair: `is_enabled(id: &SourceId, config: &Config) -> bool` answers for one source id, and `enabled_in(ids: &[SourceId], config: &Config) -> Vec<SourceId>` is the single selection function that returns the enabled ids of a list, preserving the input order. The caller — `Pipeline` and the TUI — applies `enabled_in`, and the tests below ask the per-id predicate `is_enabled` about a single source. A source whose section is missing is still registered (its `auth_state()` is `Missing`) so the user can see why it does nothing; the registry never hides it. There is no third filtering variant, in particular no "credential presence" filter inside `registry`; the old draft that filtered on `credentials.qobuz.is_some()` is removed.
   - **Pipeline method name — `source_statuses()`, not `source_status()`.** Core Task 11 defines `Pipeline::source_statuses(&self) -> Vec<SourceStatus>`; the tests below call that exact method. Each element is the core `SourceStatus { id: SourceId, capabilities: Capabilities, auth: AuthState, detail: Option<String> }`, built by calling each registered-and-enabled source's `status()`.
   - **`detail` per source (Russian, §7.11).** `QobuzSource` keeps the Task 2 priority chain (`нет учётных данных` / `ключи протухли, обновлены` / the Studio ceiling reason). `SpotifySource` reports `нужна повторная авторизация` when `reauth_hint()` is set, and `нет авторизации: только поиск и метаданные` when `auth_state() == Missing` in user mode with a valid client pair. `BandcampSource` reports `нет доступа к покупкам` when `purchase_state() == Expired`, `покупки доступны` when `Ok`, and `нет авторизации` when the section is missing. `SoundCloudSource` reports `оригинал доступен` when `oauth_token` is set, `только AAC 160k: нет oauth_token` otherwise. Screen text is Russian; the four sentences are the canonical phrases the TUI and the tests use verbatim.
-  - `auth::login` branches for `"bandcamp"` (stdin cookie), `"soundcloud"` (stdin token, empty allowed), `"qobuz"` (e-mail + password, scrape only if the stored pair is missing, verify, store). Each writes through `save_credentials`. **These branches replace, not extend, the stage 1b `stage1b_login_hint` hand-off**: for `bandcamp` the hint becomes «укажите cookie identity в credentials.toml», for `soundcloud` «укажите oauth_token в credentials.toml», and `qobuz` has «нужны учётные данные Qobuz». The stage 1b test that expected the old `stage1b_login_hint` text (`tests/auth_stage1b.rs`, lines around the `stage1b_login_hint("bandcamp")` / `("soundcloud")` assertions) must be updated to expect the new sentences; this edit is part of Task 9.
+  - `auth::login` branches for `"bandcamp"` (stdin cookie), `"soundcloud"` (stdin token, empty allowed), `"qobuz"` (e-mail + password, scrape only if the stored pair is missing, verify, store). Each writes through `save_credentials`. **These branches replace, not extend, the stage 1b `stage1b_login_hint` hand-off**: for `bandcamp` the hint becomes «укажите cookie identity в credentials.toml», for `soundcloud` «укажите oauth_token в credentials.toml», and `qobuz` has «нужны учётные данные Qobuz». The stage 1b test that expected the old `stage1b_login_hint` text (`tests/stage1b_auth.rs`, the test `the_login_hint_explains_the_stage_two_limit`, lines around the `stage1b_login_hint("bandcamp")` / `("soundcloud")` assertions) must be updated to expect the new sentences; this edit is part of Task 9.
   - **End-to-end coverage (§10).** `tests/e2e_stage2.rs` under `#![cfg(feature = "e2e")]` runs a «поиск → fetch → library scan» scenario per stage 2 source against `tiny_http` mocks, so every authenticated path is exercised once end to end; run it with `cargo test --features e2e --test e2e_stage2`.
   - `maxfetch::tui::App::set_statuses(&mut self, statuses: Vec<SourceStatus>)` and `maxfetch::tui::App::status_lines(&self) -> Vec<String>` — one line per source; `App::render_status_line(&self, status: SourceStatus) -> String` maps a status to its line.
 
@@ -1698,7 +1702,7 @@ use maxfetch::config::{Config, Credentials};
 use maxfetch::model::{Candidate, Release, SourceId};
 use maxfetch::pipeline::Pipeline;
 use maxfetch::sources::{
-    enabled_in, registry, AuthState, Capabilities, Query, Source, SourceStatus,
+    enabled_in, is_enabled, registry, AuthState, Capabilities, Query, Source, SourceStatus,
 };
 
 struct StubSource {
@@ -1751,12 +1755,14 @@ fn the_registry_holds_every_registered_source_without_filtering() {
 }
 
 #[test]
-fn enabled_in_selects_by_config_not_by_credentials() {
+fn is_enabled_selects_by_config_not_by_credentials() {
     let mut cfg = Config::default();
     cfg.sources.enabled = vec!["spotify".into()];
-    assert!(enabled_in(&cfg, SourceId::Spotify));
-    assert!(!enabled_in(&cfg, SourceId::Qobuz), "disabled in config");
-    assert!(!enabled_in(&cfg, SourceId::Bandcamp));
+    assert!(is_enabled(&SourceId::Spotify, &cfg));
+    assert!(!is_enabled(&SourceId::Qobuz, &cfg), "disabled in config");
+    assert!(!is_enabled(&SourceId::Bandcamp, &cfg));
+    // `enabled_in` is the selection function the callers use; it agrees with the per-id predicate.
+    assert_eq!(enabled_in(&[SourceId::Spotify, SourceId::Qobuz], &cfg), vec![SourceId::Spotify]);
 }
 
 #[test]
@@ -1887,7 +1893,7 @@ Create `tests/e2e_stage2.rs` — the §10 end-to-end scenario, gated behind `--f
 
 use maxfetch::config::{Config, Credentials};
 use maxfetch::pipeline::Pipeline;
-use maxfetch::sources::{enabled_in, registry, Query, SourceId};
+use maxfetch::sources::{is_enabled, registry, Query, SourceId};
 
 // One mock host serves a search hit, a resolve page and a small audio body; the pipeline
 // walks search -> candidates -> download -> library scan for each stage 2 source in turn.
@@ -1907,7 +1913,7 @@ async fn search_fetch_and_library_scan_round_trip_on_a_mock_server() {
     cfg.sources.enabled = vec!["qobuz".into(), "spotify".into(), "bandcamp".into(), "soundcloud".into()];
     let sources = registry(&cfg, &Credentials::default());
     assert!(sources.iter().any(|s| s.id() == SourceId::Qobuz));
-    assert!(enabled_in(&cfg, SourceId::Bandcamp));
+    assert!(is_enabled(&SourceId::Bandcamp, &cfg));
 
     let lib = tempfile::tempdir().unwrap();
     let pipeline = Pipeline::new(cfg, maxfetch::db::Db::open_in_memory().unwrap(), sources);
@@ -1928,7 +1934,7 @@ Expected: FAIL with "method `status` is not a member of trait `Source`".
 
 Add `fn status(&self) -> SourceStatus` as a defaulted method on `Source` in `src/sources/mod.rs`; `source_statuses` maps a slice through `status()`. `registry` stays as the core left it: it returns **every** implemented source unconditionally, with no `enabled_in` check and no credential check inside it; only the callers filter. Qobuz is therefore always registered, its `status()` reporting `нет учётных данных` when its section is missing. Apply the `detail` table from Interfaces: `SpotifySource::status()` returns `нужна повторная авторизация` when `reauth_hint()` is set and `нет авторизации: только поиск и метаданные` when `auth_state() == Missing`; `BandcampSource::status()` returns `нет доступа к покупкам` / `покупки доступны` / `нет авторизации`; `SoundCloudSource::status()` returns `оригинал доступен` / `только AAC 160k: нет oauth_token`. Each is a trait impl (`impl Source for X { fn status ... }`), never an inherent method with the same name. Set capabilities as they are: Bandcamp `lossless: true`, SoundCloud `lossless: oauth_token.is_some()`, Spotify `metadata_only: true`.
 
-`auth::login` grows three branches that **replace** the stage 1b `stage1b_login_hint` hand-off: `"bandcamp"` prints `укажите cookie identity в credentials.toml`, reads one line from stdin, trims it and stores `BandcampCredentials { identity_cookie }`; `"soundcloud"` prints `укажите oauth_token в credentials.toml` and stores the token only when non-empty; `"qobuz"` reads e-mail and password from stdin, uses the stored `app_id`/`app_secret` pair when present and scrapes only when it is absent or rejected (Task 2's `login_with_key_refresh`, which persists a fresh pair), verifies with `HttpQobuzClient::login`, and on a missing pair prints `нужны учётные данные Qobuz`. All three go through `save_credentials`, so the 0600 guarantee holds. Delete the `stage1b_login_hint` short-circuit inside `login`, or at least make the new branches run before it, and update the stage 1b test `tests/auth_stage1b.rs` that asserted the old hint text to expect the three new sentences above; that test edit belongs to this task.
+`auth::login` grows three branches that **replace** the stage 1b `stage1b_login_hint` hand-off: `"bandcamp"` prints `укажите cookie identity в credentials.toml`, reads one line from stdin, trims it and stores `BandcampCredentials { identity_cookie }`; `"soundcloud"` prints `укажите oauth_token в credentials.toml` and stores the token only when non-empty; `"qobuz"` reads e-mail and password from stdin, uses the stored `app_id`/`app_secret` pair when present and scrapes only when it is absent or rejected (Task 2's `login_with_key_refresh`, which persists a fresh pair), verifies with `HttpQobuzClient::login`, and on a missing pair prints `нужны учётные данные Qobuz`. All three go through `save_credentials`, so the 0600 guarantee holds. Delete the `stage1b_login_hint` short-circuit inside `login`, or at least make the new branches run before it, and update the stage 1b test `tests/stage1b_auth.rs` (the test `the_login_hint_explains_the_stage_two_limit`) that asserted the old hint text to expect the three new sentences above; that test edit belongs to this task.
 
 `App::set_statuses` stores the vector in the existing `status` field; `status_lines` maps it through `render_status_line`. `render_status_line` builds `format!("{} — {}", id.as_str(), text)` where `text` is, in order: `недоступен по сети` when the detail contains `не резолвится`; `нет авторизации` when `auth == Missing` and there is no detail; the detail verbatim otherwise. The TUI never invents a quality claim and never translates a source's own sentence.
 
@@ -1940,7 +1946,7 @@ Expected: PASS, 10 tests.
 Run: `cargo test --features e2e --test e2e_stage2`
 Expected: PASS, 1 test. This is the §10 end-to-end scenario; it is gated behind the `e2e` feature so the default run never opens a socket. The `e2e` feature must be declared in `Cargo.toml` (`[features] e2e = []`) in this task if it is not already there.
 
-Run: `cargo test --test auth_stage1b`
+Run: `cargo test --test stage1b_auth`
 Expected: PASS after the hint-text update from Step 3 (the old `stage1b_login_hint` sentences are replaced by the three new `auth login` messages).
 
 Run: `cargo test`
