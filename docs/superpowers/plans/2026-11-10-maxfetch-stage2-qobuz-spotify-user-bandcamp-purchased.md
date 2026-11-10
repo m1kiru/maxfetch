@@ -40,10 +40,10 @@
 The spec is a vision document; these inputs are implied by it but not covered by any explicit requirement. Each has a test pinned to the task that owns the relevant code.
 
 1. **An `app_id`/`app_secret` pair that has rotated since the last scrape.** The bundle changed, the stored pair returns 401. Expected: one re-scrape of `play.qobuz.com/bundle.js`, one retry, the fresh pair persisted, status `ключи протухли, обновлены`, and only a second failure yields `AuthState::Expired`. Pinned to Task 1 (scrape) and Task 2 (source).
-2. **A Qobuz track whose `format_id` promises 24/96 while the account has no Studio subscription.** Expected: `QualityCeiling` carries `max_lossless` 16/44.1 and the Russian reason, `candidates` offers `format_id` 6 instead of 27, and the Sources screen prints the ceiling; asking for 24 bit and failing on every attempt is the bug this prevents. Pinned to Task 1 (ladder) and Task 2 (candidates).
+2. **A Qobuz track whose `format_id` promises 24/96 while the account has no Studio subscription.** Expected: the ceiling is `min(track format ceiling, account ceiling)` = FLAC-CD, `QualityCeiling` carries `max_lossless` 16/44.1 and the Russian reason, `candidates` offers `format_id` 6 instead of 27, and the Sources screen prints the ceiling; asking for 24 bit and failing on every attempt is the bug this prevents. A track that is FLAC-CD already is not "capped" and prints no reason. Pinned to Task 1 (ladder) and Task 2 (candidates).
 3. **A Spotify refresh token revoked by a password change.** Expected: the read reports `нужна повторная авторизация`, the source drops to `client_credentials` for search and metadata, playlists vanish from results, the other sources are untouched. Pinned to Task 4 (refresh and login) and Task 5 (playlist).
 4. **A Bandcamp `identity` cookie that returns an empty collection instead of a 401.** Expected: an empty redownload list, status `нет доступа к покупкам`, `AuthState::Expired`, and the stage 1b catalogue and promo paths unchanged. Pinned to Task 6 (lookup) and Task 7 (redownload).
-5. **A SoundCloud track offering both a FLAC original and the 160 kbps AAC HLS transcode.** Expected: the original is a lossless candidate with its measured depth, `rank_candidates` puts it strictly first, and the AAC candidate survives for explicit selection. Pinned to Task 8 (original and ranking) and Task 9 (end-to-end).
+5. **A SoundCloud track offering both a FLAC original and the 160 kbps AAC HLS transcode.** Expected: the lossless original beats the AAC transcode for auto-selection (the ranked list holds only the original, §7.4), while the AAC candidate remains visible in the candidate list with `lossless = false` and its own `format: SoundCloudFormat::Aac160` locator. Pinned to Task 8 (original and ranking) and Task 9 (end-to-end).
 
 ---
 
@@ -60,10 +60,12 @@ The spec is a vision document; these inputs are implied by it but not covered by
 - Consumes: `maxfetch::model::{Container, Quality, SourceId}`, `maxfetch::config::QobuzCredentials` (core Tasks 1 and 3).
 - Produces:
   - `maxfetch::sources::qobuz::QobuzFormat` — `enum { Mp3_320, FlacCd, FlacHiRes96, FlacHiRes192 }`, `Copy + Debug + Eq + PartialEq`; `QobuzFormat::from_format_id(id: u32) -> Option<QobuzFormat>` maps 5, 6, 7, 27 and returns `None` for anything else; `QobuzFormat::format_id(&self) -> u32` is the inverse.
-  - `maxfetch::sources::qobuz::quality_of(format: QobuzFormat) -> Quality` — 5 → lossy `Mp3`, 320 kbps, 44100; 6 → lossless `Flac`, 16/44100; 7 → lossless `Flac`, 24/96000; 27 → lossless `Flac`, 24/192000.
+  - `maxfetch::sources::qobuz::quality_of(format: QobuzFormat) -> Quality` — 5 → lossy `Mp3`, 320 kbps, `sample_rate: None` (the spec pins no sample rate for MP3-320); 6 → lossless `Flac`, 16/44100; 7 → lossless `Flac`, 24/96000; 27 → lossless `Flac`, 24/192000.
   - `maxfetch::sources::qobuz::scrape_app_credentials(bundle_js: &str) -> Option<(String, String)>` — applies the regex `production:{api:{appId:"(\d{9})",appSecret:"(\w{32})"` and returns `(app_id, app_secret)`.
   - `maxfetch::sources::qobuz::QualityCeiling` — `struct { max_lossless: Quality, reason: Option<String> }`, `Clone + Debug + PartialEq`.
-  - `maxfetch::sources::qobuz::ceiling_from_limits(studio: bool) -> QualityCeiling` — with Studio `max_lossless` is 24/192000 and `reason` is `None`; without it `max_lossless` is 16/44100 and `reason` is `Some("нет подписки Studio, максимум FLAC-CD 16/44.1")`.
+  - `maxfetch::sources::qobuz::format_ceiling(format: QobuzFormat) -> Quality` — the best `Quality` that `format` can deliver: `Mp3_320` → lossy `Mp3`, 320 kbps, `sample_rate: None`; `FlacCd` → 16/44100; `FlacHiRes96` → 24/96000; `FlacHiRes192` → 24/192000.
+  - `maxfetch::sources::qobuz::account_ceiling(studio: bool) -> Quality` — with Studio the ladder maximum (24/192000); without it FLAC-CD (16/44100).
+  - `maxfetch::sources::qobuz::ceiling_from_limits(track_max: QobuzFormat, studio: bool) -> QualityCeiling` — `max_lossless = min(format_ceiling(track_max), account_ceiling(studio))` under the §7.4 ordering (depth, then rate); `reason` is `Some("нет подписки Studio, максимум FLAC-CD 16/44.1")` exactly when the account ceiling capped the result (`account_ceiling(studio) < format_ceiling(track_max)`), otherwise `None`. The tracked `format_id` of the account is the real limit; the `studio` flag only decides the account ceiling, so a 24/192 track on a non-Studio account yields a 16/44.1 ceiling with the reason, and a 16/44.1 track on a non-Studio account yields `None` (nothing was capped).
   - `maxfetch::sources::qobuz::best_format_within(ceiling: &QualityCeiling, wanted: QobuzFormat) -> QobuzFormat` — returns `wanted` when it fits the ceiling, otherwise the best ladder rung the ceiling allows.
 
 - [ ] **Step 1: Write the failing test**
@@ -115,6 +117,7 @@ fn format_ids_map_to_the_quality_ladder() {
     assert!(!mp3.lossless);
     assert_eq!(mp3.container, Container::Mp3);
     assert_eq!(mp3.bitrate_kbps, Some(320));
+    assert_eq!(mp3.sample_rate, None, "the spec pins no sample rate for MP3-320");
 
     let cd = quality_of(QobuzFormat::from_format_id(6).unwrap());
     assert!(cd.lossless);
@@ -131,7 +134,7 @@ fn format_ids_map_to_the_quality_ladder() {
 
 #[test]
 fn without_studio_the_ceiling_is_flac_cd_and_says_so() {
-    let ceiling = ceiling_from_limits(false);
+    let ceiling = ceiling_from_limits(QobuzFormat::FlacHiRes192, false);
     assert_eq!(
         (ceiling.max_lossless.bit_depth, ceiling.max_lossless.sample_rate),
         (Some(16), Some(44100))
@@ -145,10 +148,24 @@ fn without_studio_the_ceiling_is_flac_cd_and_says_so() {
 
 #[test]
 fn with_studio_the_requested_format_is_kept() {
-    let ceiling = ceiling_from_limits(true);
+    let ceiling = ceiling_from_limits(QobuzFormat::FlacHiRes96, true);
     assert!(ceiling.reason.is_none());
     assert_eq!(best_format_within(&ceiling, QobuzFormat::FlacHiRes96), QobuzFormat::FlacHiRes96);
     assert_eq!(best_format_within(&ceiling, QobuzFormat::Mp3_320), QobuzFormat::Mp3_320);
+}
+
+#[test]
+fn a_flac_cd_track_on_a_non_studio_account_is_not_capped() {
+    let ceiling = ceiling_from_limits(QobuzFormat::FlacCd, false);
+    assert_eq!((ceiling.max_lossless.bit_depth, ceiling.max_lossless.sample_rate), (Some(16), Some(44100)));
+    assert!(ceiling.reason.is_none(), "nothing was capped, so there is nothing to report");
+}
+
+#[test]
+fn a_24_192_track_on_a_non_studio_account_is_capped_to_flac_cd() {
+    let ceiling = ceiling_from_limits(QobuzFormat::FlacHiRes192, false);
+    assert_eq!((ceiling.max_lossless.bit_depth, ceiling.max_lossless.sample_rate), (Some(16), Some(44100)));
+    assert_eq!(best_format_within(&ceiling, QobuzFormat::FlacHiRes192), QobuzFormat::FlacCd);
 }
 
 #[test]
@@ -166,16 +183,18 @@ Expected: FAIL with "unresolved import `maxfetch::sources::qobuz`".
 
 - [ ] **Step 3: Implement the scraping and the ladder in `src/sources/qobuz.rs`**
 
-Add `cargo add regex`. Hold the regex in a `static` built with `std::sync::LazyLock`, so no extra crate is needed. `from_format_id` is an exhaustive match on 5, 6, 7, 27 with `_ => None`; `quality_of` sets `bitrate_kbps: Some(320)` for `Mp3_320` and `None` for the three FLAC rungs; `ceiling_from_limits` puts the Russian sentence into `reason` verbatim; `best_format_within` orders the rungs by `format_id` and returns `wanted` when `wanted.format_id() <= ceiling best rung`, else the greatest rung at or below the ceiling.
+Add `cargo add regex`. Hold the regex in a `static` built with `std::sync::LazyLock`, so no extra crate is needed. `from_format_id` is an exhaustive match on 5, 6, 7, 27 with `_ => None`; `quality_of` sets `bitrate_kbps: Some(320)` and `sample_rate: None` for `Mp3_320` and `None` for the three FLAC rungs; `format_ceiling` is the per-rung `Quality`; `account_ceiling` returns the 24/192000 `Quality` with Studio and the 16/44100 one without it; `ceiling_from_limits(track_max, studio)` takes their minimum under the §7.4 ordering and sets the Russian sentence verbatim in `reason` only when `account_ceiling(studio) < format_ceiling(track_max)`; `best_format_within` orders the rungs by `format_id` and returns `wanted` when `wanted.format_id() <= ceiling best rung`, else the greatest rung at or below the ceiling.
 
 No network, no `qobuz-api` dependency in this task.
+
+**Dependency decision (resolves the `qobuz-api` 4.0.0 uncertainty).** In Task 2 run `cargo add qobuz-api@4.0.0` first. If the crate resolves and its API covers login, `track/get`, `album/get` and `track/getFileUrl`, `HttpQobuzClient` wraps it (priority 1, the preferred path: signature and deciphering stay in the crate). If the crate does not resolve, fails to build, or does not expose those endpoints, do **not** block: implement `HttpQobuzClient` directly over `reqwest` against `https://api.qobuz.com/track/getFileUrl` (and the matching metadata endpoints), walking the `format_id` ladder of §8.5 manually and computing the request signature with `sha2` (priority 2). Both variants satisfy the same `QobuzClient` trait, so no other task changes. Record in the commit message which variant was taken.
 
 - [ ] **Step 4: Declare the module and run the test**
 
 Add `pub mod qobuz;` to `src/sources/mod.rs` (create the file only if the stage 1b plans have not).
 
 Run: `cargo test --test qobuz_quality`
-Expected: PASS, 6 tests.
+Expected: PASS, 8 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -199,8 +218,9 @@ git commit -m "feat(qobuz): app credential scraping and format ladder"
   - `maxfetch::sources::qobuz::QobuzTrack` — `struct { id: String, title: String, performer: String, album: Option<String>, isrc: Option<String>, duration_sec: Option<f64>, year: Option<i32>, max_format: QobuzFormat }`, `Clone + Debug`.
   - `maxfetch::sources::qobuz::QobuzClient` — `#[async_trait] trait QobuzClient: Send + Sync` with `async fn login(&self, email: &str, password: &str, app_id: &str, app_secret: &str) -> anyhow::Result<QobuzSession>`, `async fn fetch_bundle(&self) -> anyhow::Result<String>`, `async fn track(&self, session: &QobuzSession, track_id: &str) -> anyhow::Result<QobuzTrack>`, `async fn stream_url(&self, session: &QobuzSession, track_id: &str, format: QobuzFormat) -> anyhow::Result<String>`.
   - `maxfetch::sources::qobuz::HttpQobuzClient` — the production implementation, the only code that talks to `api.qobuz.com` or constructs a `qobuz-api` type; `HttpQobuzClient::new(timeout_sec: u64) -> HttpQobuzClient`.
-  - `maxfetch::sources::qobuz::QobuzSource` — `struct { client: Box<dyn QobuzClient>, creds: Option<QobuzCredentials>, session: tokio::sync::Mutex<Option<QobuzSession>>, last_key_refresh: tokio::sync::Mutex<Option<std::time::Instant>>, last_error: tokio::sync::Mutex<Option<String>>, refreshed: std::sync::atomic::AtomicBool }`; constructors `QobuzSource::new(client: Box<dyn QobuzClient>, creds: Option<QobuzCredentials>) -> QobuzSource` and `QobuzSource::from_credentials(creds: &QobuzCredentials) -> QobuzSource`.
-  - `QobuzSource::status(&self) -> SourceStatus` — an inherent method in this task; Task 9 wires it into the trait's defaulted `status`.
+  - `maxfetch::sources::qobuz::QobuzSource` — `struct { client: Box<dyn QobuzClient>, creds: Option<QobuzCredentials>, session: tokio::sync::Mutex<Option<QobuzSession>>, last_key_refresh: tokio::sync::Mutex<Option<std::time::Instant>>, last_error: tokio::sync::Mutex<Option<String>>, refreshed: std::sync::atomic::AtomicBool }`; constructors `QobuzSource::new(client: Box<dyn QobuzClient>, creds: Option<QobuzCredentials>) -> QobuzSource` (no credential persistence; used where no `credentials.toml` is at hand), `QobuzSource::with_dir(client: Box<dyn QobuzClient>, creds: Option<QobuzCredentials>, dir: &Path) -> QobuzSource` (the constructor that persists a scraped pair into `dir`) and `QobuzSource::from_credentials(creds: &QobuzCredentials, dir: &Path) -> QobuzSource` (production: `with_dir` over `HttpQobuzClient::new(…)`).
+  - `impl Source for QobuzSource` implements `status(&self) -> SourceStatus` (the trait method Task 9 adds as a defaulted method). There is **no** inherent `QobuzSource::status`; an inherent method with the same name would shadow the trait default and the trait call would return an empty `detail`. The trait impl returns `SourceStatus { id: SourceId::Qobuz, capabilities: Capabilities { audio: true, metadata_only: false, lossless: true, needs_auth: true }, auth, detail }`, where `auth` is `Missing` when `creds` is `None`, `Expired` after a failed login, `Ok` otherwise, and `detail` is, in priority order: the last error (`нет учётных данных` when `creds` is `None`), then `ключи протухли, обновлены` while the `refreshed` flag is set, then `ceiling_from_limits(track_max, session.studio).reason` for the last resolved track's `max_format`. `detail` is always filled for a source that has something to say, otherwise `None`.
+  - **Scraped-pair persistence.** The scraped `app_id`/`app_secret` are never thrown away: `login_with_key_refresh` writes the pair it used into the `[qobuz]` section of `credentials.toml` (`app_id`, `app_secret`) through `Credentials::save_to(dir)` (Task 4's `PersistedCredentials` write mutex). On the next start `from_credentials` uses the stored pair when both fields are non-empty and scrapes only when the pair is absent or the server answered with an authentication error. The status `ключи протухли, обновлены` is therefore a one-off, and a stored pair that keeps failing is diagnosed as `AuthState::Expired` rather than re-scraped on every run.
   - `maxfetch::sources::qobuz::KEY_REFRESH_COOLDOWN` — `const : std::time::Duration` = 60 s.
 
 - [ ] **Step 1: Write the failing test**
@@ -218,7 +238,7 @@ use maxfetch::sources::qobuz::{QobuzClient, QobuzFormat, QobuzSource, QobuzSessi
 use maxfetch::sources::{AuthState, Query, QueryItem, Source};
 
 fn creds() -> Option<QobuzCredentials> {
-    Some(QobuzCredentials { email: "listener@example.com".into(), password: "pw".into(), app_id: String::new(), app_secret: String::new() })
+    Some(QobuzCredentials { email: "listener@example.com".into(), password: "pw".into(), app_id: "950096962".into(), app_secret: "a1b2c3d4e5f60718293a4b5c6d7e8f90".into() })
 }
 
 fn track() -> QobuzTrack {
@@ -266,6 +286,33 @@ impl QobuzClient for FakeQobuz {
 
 fn source(fake: FakeQobuz) -> QobuzSource {
     QobuzSource::new(Box::new(fake), creds())
+}
+
+#[tokio::test]
+async fn the_scraped_pair_is_persisted_and_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let creds = QobuzCredentials { email: "listener@example.com".into(), password: "pw".into(), app_id: String::new(), app_secret: String::new() };
+    // An absent pair means the first resolve scrapes the bundle and persists the fresh pair.
+    let src = QobuzSource::with_dir(Box::new(fake(true)), Some(creds), dir.path());
+    src.resolve(&query()).await.unwrap();
+    let saved = maxfetch::config::Credentials::load_from(dir.path()).unwrap().qobuz.unwrap();
+    assert_eq!(saved.app_id, "950096962");
+    assert_eq!(saved.app_secret, "a1b2c3d4e5f60718293a4b5c6d7e8f90");
+    assert_eq!(saved.email, "listener@example.com");
+}
+
+#[tokio::test]
+async fn a_stored_pair_is_not_scraped_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let stored = QobuzCredentials { email: "listener@example.com".into(), password: "pw".into(), app_id: "950096962".into(), app_secret: "a1b2c3d4e5f60718293a4b5c6d7e8f90".into() };
+    let scrapes = Arc::new(AtomicUsize::new(0));
+    let src = QobuzSource::with_dir(
+        Box::new(FakeQobuz { studio: true, logins: Default::default(), scrapes: scrapes.clone(), fail_upto: 0, stream_base: "http://127.0.0.1:1".into() }),
+        Some(stored),
+        dir.path(),
+    );
+    src.resolve(&query()).await.unwrap();
+    assert_eq!(scrapes.load(Ordering::SeqCst), 0, "a working stored pair must never be re-scraped");
 }
 
 fn query() -> Query {
@@ -398,14 +445,15 @@ Expected: FAIL with "unresolved import `maxfetch::sources::qobuz::QobuzSource`".
 
 - [ ] **Step 3: Implement the source**
 
-Add `cargo add qobuz-api@4.0.0`, `cargo add async-trait`, `cargo add --dev tiny_http`. `HttpQobuzClient::new(timeout_sec)` holds `fetch::http_client(timeout_sec)`; `fetch_bundle` GETs `https://play.qobuz.com/bundle.js`; `login` uses a `qobuz-api` client and fills `studio` from `user.credential.parameters.hires` (falling back to `lossless` when `hires` is absent); `track` maps the crate response into `QobuzTrack` and reads `album.max_format_id` as `max_format` (defaulting to `FlacCd` when the field is missing); `stream_url` asks the crate for the signed URL of that `format_id`. No `qobuz-api` type appears in any signature above.
+Add `cargo add qobuz-api@4.0.0`, `cargo add async-trait`, `cargo add --dev tiny_http`. Apply the dependency decision recorded in Task 1: wrap `qobuz-api` when it resolves and covers login / `track/get` / `album/get` / `track/getFileUrl`; otherwise implement `HttpQobuzClient` over `reqwest` against `https://api.qobuz.com` with the `sha2` signature and the §8.5 ladder. `HttpQobuzClient::new(timeout_sec)` holds `fetch::http_client(timeout_sec)`; `fetch_bundle` GETs `https://play.qobuz.com/bundle.js`; `login` fills `studio` from `user.credential.parameters.hires` (falling back to `lossless` when `hires` is absent); `track` maps the response into `QobuzTrack` and reads `album.max_format_id` as `max_format` (defaulting to `FlacCd` when the field is missing); `stream_url` asks for the signed URL of that `format_id`. No client-crate type appears in any signature above.
 
 `QobuzSource::login_with_key_refresh(email, password)` is the only token algorithm and does exactly this:
 
 ```text
 pair := (creds.app_id, creds.app_secret)
-if pair.app_id is empty:
+if pair.app_id is empty or pair.app_secret is empty:
     pair := scrape(client.fetch_bundle()) or bail "Qobuz: не удалось получить app_id из bundle.js"
+    persist pair into creds.qobuz.app_id / creds.qobuz.app_secret (Credentials::save_to(dir))
 first := client.login(email, password, pair)
 if first is Ok: return first
 if the first error does not contain "401": return Err(first)
@@ -413,20 +461,23 @@ if last_key_refresh is Some(t) and t.elapsed() < KEY_REFRESH_COOLDOWN: return Er
 fresh := scrape(client.fetch_bundle()) or bail "Qobuz: ключи протухли, обновить не удалось: <first>"
 second := client.login(email, password, fresh)
 if second is Err: return Err("Qobuz: ключи протухли, повторный вход не удался: <second>")
+persist fresh into creds (Credentials::save_to(dir))
 refreshed := true
 return second
 ```
 
+A stored pair is always tried first and never re-scraped while it works; the scrape happens only when the stored pair is missing or the server rejected it with an authentication error. `with_dir`/`from_credentials` keep `dir`, the directory of `credentials.toml`, for those writes; `QobuzSource::new` (used only where no file is written) drops the pair after the session instead of persisting it, so a caller that has no `dir` never silently loses it — Task 9's `registry` uses `from_credentials`.
+
 `session()` returns the cached session when present, otherwise calls `login_with_key_refresh` with the e-mail and password from `creds` (bailing `"Qobuz: нет учётных данных"` when `creds` is `None`) and stores the result plus `Instant::now()`. On every failure it also writes the message into `last_error`.
 
-`status()` returns `SourceStatus { id: Qobuz, capabilities: Capabilities { audio: true, metadata_only: false, lossless: true, needs_auth: true }, auth, detail }`, where `detail` is, in priority order: the last error (`нет учётных данных` when `creds` is `None`), then `ключи протухли, обновлены` while the `refreshed` flag is set, then `ceiling_from_limits(session.studio).reason`. `auth` is `Missing` without credentials, `Expired` after a failed login, `Ok` otherwise.
+`impl Source for QobuzSource::status()` (the trait method, not an inherent one) returns `SourceStatus { id: Qobuz, capabilities: Capabilities { audio: true, metadata_only: false, lossless: true, needs_auth: true }, auth, detail }`, where `detail` is, in priority order: the last error (`нет учётных данных` when `creds` is `None`), then `ключи протухли, обновлены` while the `refreshed` flag is set, then `ceiling_from_limits(track.max_format, session.studio).reason`. `auth` is `Missing` without credentials, `Expired` after a failed login, `Ok` otherwise.
 
-`resolve` accepts only `QueryItem::Track { source: Qobuz, id }` and maps each `QobuzTrack` into a `Release`; other item types are ignored. `candidates` recomputes the track, takes `wanted = track.max_format`, applies `best_format_within(&ceiling, wanted)` and emits exactly one `Candidate` at that format with `Locator::Qobuz { track_id, format_id }` and `quality_of(chosen)`. `download` calls `stream_url` and then `fetch::download_to_file(client, &url, dest, sink)`; it does not probe (the pipeline owns probing).
+`resolve` accepts only `QueryItem::Track { source: Qobuz, id }` and maps each `QobuzTrack` into a `Release`; other item types are ignored. `candidates` recomputes the track, takes `wanted = track.max_format`, applies `best_format_within(&ceiling_from_limits(track.max_format, studio), wanted)` and emits exactly one `Candidate` at that format with `Locator::Qobuz { track_id, format_id }` and `quality_of(chosen)`. `download` calls `stream_url` and then `fetch::download_to_file(client, &url, dest, sink)`; it does not probe (the pipeline owns probing).
 
 - [ ] **Step 4: Run the test**
 
 Run: `cargo test --test qobuz_source`
-Expected: PASS, 7 tests.
+Expected: PASS, 9 tests.
 
 Do not register the source in `registry` yet; Task 9 does that once every stage 2 source exists.
 
@@ -587,7 +638,8 @@ git commit -m "feat(oauth): pkce and loopback redirect server"
   - `maxfetch::auth::PersistedCredentials` — `struct { inner: std::sync::Arc<tokio::sync::RwLock<Credentials>>, path: PathBuf }` with `load() -> anyhow::Result<PersistedCredentials>`, `async fn get(&self) -> Credentials`, `async fn update(&self, f: impl FnOnce(&mut Credentials) + Send) -> anyhow::Result<()>`.
   - `maxfetch::auth::exchange_spotify_code(token_endpoint: &str, client_id: &str, code: &str, redirect_uri: &str, verifier: &str) -> anyhow::Result<TokenResponse>`.
   - `maxfetch::auth::last_login_url() -> Option<String>` — the URL the current `login` is waiting on, readable by an operator and by a test.
-  - `maxfetch::auth::override_token_endpoint(url: Option<&str>)` — replaces the token endpoint for the current process, so `login` can be tested against a `127.0.0.1` mock; `None` restores `SPOTIFY_TOKEN_ENDPOINT`. The override exists for tests only and never reads an environment variable.
+  - `maxfetch::auth::login_with(source: &str, creds: &mut Credentials, options: LoginOptions) -> anyhow::Result<()>` — the testable entry point; `LoginOptions` holds the fields a test must override: `dir: PathBuf` (where `credentials.toml` is written), `token_endpoint: Option<String>` (the Spotify token endpoint, `None` means `SPOTIFY_TOKEN_ENDPOINT`), `auth_endpoint: Option<String>` and `port_range: std::ops::RangeInclusive<u16>` (42424..42427 by default). The public `login(source, creds)` is `login_with(source, creds, LoginOptions::default())`.
+  - **No global test state.** The token endpoint is a per-call field of `LoginOptions`, not a process-wide override; there is no `override_token_endpoint` function and no environment variable read by `login`. The credentials path is likewise a field (`dir`), so a test uses a `tempfile::TempDir` and `Credentials::save_to(dir)` / `Credentials::load_from(dir)` explicitly and never touches `XDG_CONFIG_HOME`. Two `login` tests can therefore run in parallel.
   - `maxfetch::auth::{SPOTIFY_AUTH_ENDPOINT, SPOTIFY_TOKEN_ENDPOINT, SPOTIFY_SCOPE, WAIT_MESSAGE}` — `"https://accounts.spotify.com/authorize"`, `"https://accounts.spotify.com/api/token"`, `"playlist-read-private playlist-read-collaborative"`, `"откройте ссылку в браузере и подтвердите доступ"`.
   - `auth::login("spotify", &mut Credentials)` replaces the core's bail branch: binds a `LoopbackServer` on the first free port of 42424..42427, announces the URL, waits 300 s, exchanges the code, stores `refresh_token` and saves at 0600.
 
@@ -695,7 +747,7 @@ Create `tests/auth_spotify.rs`:
 ```rust
 use std::io::Read;
 
-use maxfetch::auth::{exchange_spotify_code, last_login_url, login};
+use maxfetch::auth::{exchange_spotify_code, last_login_url, login_with, LoginOptions};
 use maxfetch::config::{Credentials, SpotifyCredentials};
 
 #[tokio::test]
@@ -732,21 +784,21 @@ async fn login_spotify_persists_the_refresh_token_with_mode_0600() {
         let fixture = std::fs::read_to_string(format!("{}/tests/fixtures/spotify/token_exchange.json", env!("CARGO_MANIFEST_DIR"))).unwrap();
         req.respond(tiny_http::Response::from_string(fixture)).unwrap();
     });
-    let token_endpoint = format!("http://127.0.0.1:{token_port}/api/token");
-    maxfetch::auth::override_token_endpoint(Some(&token_endpoint));
 
     let dir = tempfile::tempdir().unwrap();
-    let old = std::env::var_os("XDG_CONFIG_HOME");
-    unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
-
     let creds = Credentials {
         spotify: Some(SpotifyCredentials { client_id: "id".into(), client_secret: "secret".into(), refresh_token: None }),
         ..Credentials::default()
     };
 
-    let login_task = tokio::spawn(async move {
-        let mut creds = creds.clone();
-        login("spotify", &mut creds).await.map(|_| creds)
+    let login_task = tokio::spawn({
+        let dir = dir.path().to_path_buf();
+        let token_endpoint = format!("http://127.0.0.1:{token_port}/api/token");
+        async move {
+            let mut creds = creds.clone();
+            let opts = LoginOptions { dir, token_endpoint: Some(token_endpoint), auth_endpoint: None, ..LoginOptions::default() };
+            login_with("spotify", &mut creds, opts).await.map(|_| creds)
+        }
     });
 
     let url = loop {
@@ -766,15 +818,12 @@ async fn login_spotify_persists_the_refresh_token_with_mode_0600() {
     let stored = creds.spotify.unwrap();
     assert!(stored.refresh_token.is_some());
 
-    let path = dir.path().join("maxfetch").join("credentials.toml");
+    let path = dir.path().join("credentials.toml");
     let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&path).unwrap().permissions()) & 0o777;
     assert_eq!(mode, 0o600);
+    let reloaded = Credentials::load_from(dir.path()).unwrap();
+    assert!(reloaded.spotify.unwrap().refresh_token.is_some(), "the redirect token is on disk, not only in memory");
 
-    match old {
-        Some(v) => unsafe { std::env::set_var("XDG_CONFIG_HOME", v) },
-        None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
-    }
-    maxfetch::auth::override_token_endpoint(None);
     token_handle.join().unwrap();
 }
 
@@ -824,7 +873,7 @@ Add `cargo add --dev tiny_http` if Task 2 has not. `PersistedCredentials::update
 
 `exchange_spotify_code` POSTs `form_body(&[("grant_type", "authorization_code"), ("code", code), ("redirect_uri", redirect_uri), ("client_id", client_id), ("code_verifier", verifier)])` with `Content-Type: application/x-www-form-urlencoded` and parses `TokenResponse`; a non-2xx becomes `anyhow::bail!("обмен кода не удался: {status}")`.
 
-`login("spotify", creds)` binds the first free port of 42424..42427, generates `Pkce::generate()` and a `state` the same way, calls `expect_state`, builds the URL, stores it in the `last_login_url` cell and emits `tracing::info!("{WAIT_MESSAGE}: {url}")`. It awaits `wait_for_code(Duration::from_secs(300))`, exchanges the code at the endpoint `override_token_endpoint` has installed (or `SPOTIFY_TOKEN_ENDPOINT`), writes `creds.spotify.refresh_token` and calls `save_credentials(creds)`. Clear the URL cell when the flow ends, whether it succeeded or not. Leave the `bandcamp`, `soundcloud` and `qobuz` branches at the core's bail message; Task 9 replaces them.
+`login("spotify", creds)` is `login_with("spotify", creds, LoginOptions::default())`. `login_with` binds the first free port of the range in `options.port_range`, generates `Pkce::generate()` and a `state` the same way, calls `expect_state`, builds the URL against `options.auth_endpoint` (or `SPOTIFY_AUTH_ENDPOINT`), stores it in the `last_login_url` cell and emits `tracing::info!("{WAIT_MESSAGE}: {url}")`. It awaits `wait_for_code(Duration::from_secs(300))`, exchanges the code at `options.token_endpoint` (or `SPOTIFY_TOKEN_ENDPOINT`), writes `creds.spotify.refresh_token` and saves to `options.dir` at 0600. Clear the URL cell when the flow ends, whether it succeeded or not. Leave the `bandcamp`, `soundcloud` and `qobuz` branches at the core's bail message; Task 9 replaces them, and it is Task 9 that deletes the `stage1b_login_hint` hand-off (see Task 9, the stage 1b test must be updated there).
 
 - [ ] **Step 4: Run the tests and the whole suite**
 
@@ -862,6 +911,7 @@ git commit -m "feat(spotify): refresh rotation, auth login and persisted credent
   - `SpotifySource::fetch_playlist(&self, playlist_id: &str) -> anyhow::Result<Vec<PlaylistItem>>` — `GET {api}/v1/playlists/{id}/items`, `limit=100&offset=`, tolerant of both the `items[].track` and `items[].item` wrappers.
   - `SpotifySource::playlist_releases(&self, playlist_id: &str) -> anyhow::Result<Vec<Release>>` — one `Release` per item with `source: Spotify`, `source_item_id: track_id`, `track_no: None`.
   - `SpotifySource::with_api_base(creds: SpotifyCredentials, base: String, access_token: &str) -> SpotifySource` — the test constructor.
+  - **`auth_state()` in user mode (semantics fixed here).** `SpotifySource::auth_state()` returns, for Spotify: `Missing` when `client_id` or `client_secret` is empty (the source cannot even use `client_credentials`, so there is nothing to authorize); `Expired` when the client pair is present and a `refresh_token` exists but a refresh has failed with `invalid_grant` (the `reauth_hint` is set); `Authenticated`/`Ok` when there is a valid token. An empty `refresh_token` with a present client pair is `Missing` — user mode is not configured, but client mode still works, and the TUI reports exactly this state (`{"нет авторизации"}` because playlists need a user token). Test `a_playlist_without_a_user_token_reports_the_hint` pins `AuthState::Missing` for that case.
   - `Pipeline::search` gains one rule inside the existing `QueryItem::Playlist` expansion branch: a `QueryItem::Playlist { source: Spotify, .. }` is expanded through `SpotifySource::playlist_releases` only when `mode() == User`; in `ClientCredentials` mode the source contributes zero releases and its `reauth_hint()` reaches the user through `SourceStatus.detail` (Task 9), the same channel the core plan uses for a skipped source. No signature changes.
 
 - [ ] **Step 1: Write the failing test**
@@ -952,6 +1002,8 @@ Expected: FAIL with "no function or associated item named `parse_playlist_items`
 
 `with_api_base` stores the base URL and a pre-issued access token; production uses `https://api.spotify.com`.
 
+`auth_state()` follows the user-mode semantics from Interfaces: `Missing` when `client_id` or `client_secret` is empty, `Expired` when a `refresh_token` exists but the last refresh failed with `invalid_grant`, `Ok` when a valid token exists, and `Missing` again for an empty `refresh_token` with a present client pair. The TUI line for that last case is `нет авторизации`, which is honest: search and metadata work, playlists do not.
+
 The `Pipeline::search` rule lives only in the `QueryItem::Playlist` expansion branch: for `Spotify`, call `playlist_releases` when `mode() == User`, otherwise contribute zero releases for that item and leave the hint to `SourceStatus.detail`. Do not add a log entry and do not change `Pipeline`'s signature; the core plan's search returns only `Vec<ReleaseGroup>`.
 
 - [ ] **Step 4: Run the test and the whole suite**
@@ -981,8 +1033,9 @@ git commit -m "feat(spotify): playlist reads with a user token"
 - Test: `tests/bandcamp_purchased.rs`
 
 **Interfaces:**
-- Consumes: `maxfetch::config::BandcampCredentials { identity_cookie }`, `maxfetch::fetch::http_client`, the stage 1b `BandcampSource` and its HTML helpers.
+- Consumes: `maxfetch::config::BandcampCredentials { identity_cookie }`, `maxfetch::config::Config`, `std::path::Path`, `maxfetch::fetch::http_client`, the stage 1b `BandcampSource` and its HTML helpers.
 - Produces:
+  - **`BandcampSource` constructor set (canonical; Task 7 reuses it and stage 1b Task 5 must match it).** `BandcampSource::new(config: &Config, credentials: &Credentials) -> BandcampSource` (production: `credentials.bandcamp` feeds the cookie, `config` feeds the API base); `BandcampSource::with_api_base(api_base: &str, cache_root: &Path) -> BandcampSource` (stage 1b test constructor, no credentials); `BandcampSource::with_lookups(creds: BandcampCredentials, hook: Box<dyn Fn(u64, &str) -> anyhow::Result<String> + Send + Sync>) -> BandcampSource` (Task 6 test constructor for the purchase lookup); `BandcampSource::without_credentials() -> BandcampSource` (no cookie, purchase state `NotNeeded`). No other constructor is introduced. If stage 1b Task 5 ends up with a different set (for example `with_endpoints`), it must be brought to this list by a separate edit to the stage 1b plan before Task 7 relies on it.
   - `maxfetch::sources::bandcamp::fan_id_from_html(html: &str) -> Option<u64>` — reads the `data-tralbum-collect-info` block and returns its `fan_id`.
   - `maxfetch::sources::bandcamp::RedownloadEntry` — `struct { sale_item_type: String, sale_item_id: u64, album_title: String, redownload_url: String }`, `Clone + Debug + PartialEq`.
   - `maxfetch::sources::bandcamp::parse_search_items(json: &str) -> anyhow::Result<Vec<RedownloadEntry>>` — keys `redownload_urls` by `sale_item_type + sale_item_id` and joins them with `collection_items[]` for the title.
@@ -1114,15 +1167,20 @@ git commit -m "feat(bandcamp): identity cookie and purchase lookup"
 - Test: `tests/bandcamp_redownload.rs`
 
 **Interfaces:**
-- Consumes: Task 6's `RedownloadEntry`, `lookup_purchases`, `parse_search_items`, `without_credentials`; `maxfetch::model::{Candidate, Container, Locator, Quality, Release, SourceId}`; `maxfetch::fetch::{download_to_file, http_client, ProgressSink}`.
+- Consumes: Task 6's `RedownloadEntry`, `lookup_purchases`, `parse_search_items`, `BandcampSource::{new, with_api_base, without_credentials}`; `maxfetch::model::{Candidate, Container, Locator, Quality, Release, SourceId}`; `maxfetch::match::norm`; `maxfetch::fetch::{download_to_file, http_client, ProgressSink}`; `maxfetch::probe::probe`.
 - Produces:
   - `maxfetch::sources::bandcamp::BandcampFormat` — `enum { Flac, Wav, Aiff, Alac, Mp3V0, Mp3_320, AacHi, Vorbis }`, `Copy + Debug + Eq + PartialEq`; `all() -> &'static [BandcampFormat]` in preference order `Flac, Wav, Aiff, Alac, Mp3V0, Mp3_320, AacHi, Vorbis`; `encoding_key(&self) -> &'static str` → `"flac"`, `"wav"`, `"aiff"`, `"alac"`, `"mp3-v0"`, `"mp3-320"`, `"aac-hi"`, `"vorbis"`.
   - `maxfetch::sources::bandcamp::DownloadFormat` — `struct { key: String, url: String, size_mb: Option<f64>, encoding_name: Option<String> }`, `Clone + Debug + PartialEq`.
   - `maxfetch::sources::bandcamp::parse_download_page(html: &str) -> anyhow::Result<Vec<DownloadFormat>>` — reads `pagedata` → `digital_items[0].downloads` and returns one entry per present, non-empty key in ladder order.
-  - `maxfetch::sources::bandcamp::quality_of_format(format: BandcampFormat, encoding_name: Option<&str>) -> Quality` — the four lossless variants are lossless with the container of their variant and the depth/rate parsed from `encoding_name` when present; `Mp3V0` 245 kbps, `Mp3_320` 320 kbps, `AacHi` 256 kbps, `Vorbis` 500 kbps are lossy with `sample_rate: None`.
+  - `maxfetch::sources::bandcamp::quality_of_format(format: BandcampFormat, encoding_name: Option<&str>) -> Quality` — the four lossless variants are lossless with the container of their variant and the depth/rate parsed from `encoding_name` when present. **Canonical lossy table (the single table for both this task and stage 1b Task 3; §8.2 gives no bitrate for the first three, so none is invented):** `Mp3V0` → lossy `Mp3`, `bitrate_kbps: None`; `Mp3_320` → lossy `Mp3`, `Some(320)`; `AacHi` → lossy `M4aAac`, `bitrate_kbps: None`; `Vorbis` → lossy `Container::Opus`, `bitrate_kbps: None`. `sample_rate` is `None` for every lossy variant.
   - `BandcampSource::download_candidates(&self, entry: &RedownloadEntry, page_html: &str) -> anyhow::Result<Vec<Candidate>>` — one candidate per lossless format when any exists, otherwise one per lossy format, each `Locator::Bandcamp { url, encoding: key }`.
   - `BandcampSource::unpack_album_zip(zip_path: &Path, dest_dir: &Path) -> anyhow::Result<Vec<PathBuf>>` — synchronous, testable without the network.
   - `BandcampSource::download_zip(&self, candidate: &Candidate, dest_dir: &Path, sink: &dyn ProgressSink) -> anyhow::Result<Vec<PathBuf>>` — downloads to a temp file, then `unpack_album_zip`.
+  - **`impl Source for BandcampSource::download(&self, candidate: &Candidate, dest: &Path, sink: &dyn ProgressSink) -> anyhow::Result<()>` — the trait path for a purchased album.** It unpacks through `download_zip` into a scratch directory beside `dest` (a `tempfile` dir under `dest`'s parent), maps the members to the release's tracklist with `match::norm` (the algorithm below), and then hands the matching member to the pipeline's normal per-track flow so it gets `probe`d, tagged and moved exactly like a catalogue download. The single-track case (a `Locator::Bandcamp` without a fragment that resolves to one file) copies that file to `dest` and leaves probing to the pipeline. Signature is the core trait's; nothing new is added to the trait.
+  - **Member-to-track matching (used by `download` and by `download_zip`'s caller).** The release carried by the candidate is the redownload entry's release; its tracklist order gives `track_no`. For each unpacked audio member in ZIP order: take the file stem, strip a leading `^\d{1,3}[\s._-]+` track-number prefix, and compare `match::norm(stem_without_prefix)` with `match::norm(track.title)` from the release's tracklist; the first track whose normalized title matches wins and the member receives that track's `track_no`. A member that matches no title is logged at `tracing::warn!` (`Bandcamp: файл «{name}» не сопоставлен с треком`) and skipped; a track that receives no member is simply left out of this download (partial success is normal, §7.5). Never guess a `track_no` from the file name alone when the title does not match.
+  - **Probe gate (§7.5).** A purchased file is probed before it is written to the database: the measured quality is what the DB and the tags store, and a file whose measured quality is worse than the candidate claimed (for example a `flac` download that measures 16/44.1 when 24/96 was advertised) is rejected, deleted and reported, never stored with the claim. This is the same rejection rule the pipeline applies to every other source; the test below pins it on the Bandcamp path.
+  - `maxfetch::sources::bandcamp::match_album_members(members: &[&str], track_titles: &[&str]) -> Vec<(String, u32)>` — the pure matching helper (see the algorithm above): `(member_name, track_no)` for each member that matched a title, in member order, unmatched members omitted.
+  - `maxfetch::sources::bandcamp::verify_purchased_quality(path: &Path, claimed: &Quality) -> anyhow::Result<Option<Quality>>` — probes `path`; `Ok(None)` when the measured quality is strictly worse than `claimed` (the file is deleted first), `Ok(Some(measured))` otherwise.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1141,8 +1199,11 @@ use std::io::Write;
 
 use maxfetch::fetch::NoopSink;
 use maxfetch::model::{Candidate, Container, Locator, Quality, Release, SourceId};
+use maxfetch::quality::rank_candidates;
+use maxfetch::sources::Source;
 use maxfetch::sources::bandcamp::{
-    parse_download_page, quality_of_format, BandcampFormat, BandcampSource, RedownloadEntry,
+    match_album_members, parse_download_page, quality_of_format, verify_purchased_quality,
+    BandcampFormat, BandcampSource, RedownloadEntry,
 };
 
 fn fixture() -> String {
@@ -1194,9 +1255,11 @@ fn an_undeclared_depth_is_not_invented() {
 
 #[test]
 fn lossy_variants_map_to_their_bitrates() {
-    assert_eq!(quality_of_format(BandcampFormat::Mp3V0, Some("MP3 V0")).bitrate_kbps, Some(245));
+    assert_eq!(quality_of_format(BandcampFormat::Mp3V0, Some("MP3 V0")).bitrate_kbps, None);
     assert_eq!(quality_of_format(BandcampFormat::Mp3_320, None).bitrate_kbps, Some(320));
+    assert_eq!(quality_of_format(BandcampFormat::AacHi, None).bitrate_kbps, None);
     assert!(!quality_of_format(BandcampFormat::Vorbis, None).lossless);
+    assert_eq!(quality_of_format(BandcampFormat::Vorbis, None).bitrate_kbps, None);
     assert_eq!(BandcampFormat::all()[0], BandcampFormat::Flac);
 }
 
@@ -1263,6 +1326,89 @@ async fn a_non_zip_body_is_a_clear_error() {
     assert!(format!("{err}").contains("ZIP"), "{err}");
     assert!(!dir.path().join("x.zip").exists(), "a failed download leaves no partial archive");
 }
+
+#[test]
+fn members_are_matched_to_the_tracklist_by_normalized_title() {
+    let out = match_album_members(
+        &["01 Get Lucky.flac", "Instant Crush.flac", "cover.jpg", "99 Bonus.flac"],
+        &["Get Lucky", "Instant Crush"],
+    );
+    assert_eq!(out, vec![("01 Get Lucky.flac".to_string(), 1), ("Instant Crush.flac".to_string(), 2)]);
+}
+
+#[test]
+fn an_unmatched_member_is_skipped_not_guessed() {
+    let out = match_album_members(&["04 Some Other Song.flac"], &["Get Lucky"]);
+    assert!(out.is_empty(), "a file that matches no title gets no track number");
+}
+
+fn album_zip(members: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut buf);
+        let opts = zip::write::SimpleFileOptions::default();
+        for (name, body) in members {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf.into_inner()
+}
+
+fn purchased_candidate(url: String, encoding: &str, depth: u8, rate: u32) -> Candidate {
+    Candidate {
+        source: SourceId::Bandcamp,
+        release: Release {
+            title: "Random Access Memories".into(), artist: "Daft Punk".into(), album: None, track_no: None,
+            duration_sec: None, isrc: None, year: None, source: SourceId::Bandcamp, source_item_id: "a345678901".into(),
+        },
+        quality: Quality { lossless: true, container: Container::Flac, bit_depth: Some(depth), sample_rate: Some(rate), bitrate_kbps: None },
+        size_bytes: None,
+        locator: Locator::Bandcamp { url, encoding: encoding.into() },
+    }
+}
+
+#[tokio::test]
+async fn a_purchased_album_download_yields_one_file_per_matched_track() {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let port = server.server_addr().to_ip().unwrap().port();
+    let zip_bytes = album_zip(&[("01 Get Lucky.flac", b"flac-1".as_slice()), ("02 Instant Crush.flac", b"flac-2".as_slice())]);
+    let handle = std::thread::spawn(move || {
+        let req = server.recv().unwrap();
+        req.respond(tiny_http::Response::from_data(zip_bytes)).unwrap();
+    });
+    let cand = purchased_candidate(format!("http://127.0.0.1:{port}/album.zip"), "flac", 16, 44100);
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("download");
+    std::fs::create_dir_all(&dest).unwrap();
+    let src = BandcampSource::without_credentials();
+    // The trait path (Source::download) unpacks and hands one file per matched track to the pipeline.
+    src.download(&cand, &dest, &NoopSink).await.unwrap();
+    let written = std::fs::read_dir(&dest).unwrap().count();
+    assert_eq!(written, 2, "the trait path yields one file per matched track");
+    handle.join().unwrap();
+}
+
+#[tokio::test]
+async fn a_file_below_its_claimed_quality_is_rejected_and_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("track.flac");
+    std::fs::copy(
+        format!("{}/tests/fixtures/probe/sine_44100_s16.flac", env!("CARGO_MANIFEST_DIR")),
+        &file,
+    ).unwrap();
+    // Claimed 24/96 but the fixture measures 16/44.1: the claim must not survive into the DB.
+    let claimed = Quality { lossless: true, container: Container::Flac, bit_depth: Some(24), sample_rate: Some(96000), bitrate_kbps: None };
+    let verdict = verify_purchased_quality(&file, &claimed).unwrap();
+    assert!(verdict.is_none(), "the measured quality is strictly worse than the claim");
+    assert!(!file.exists(), "a rejected file is deleted, never stored with the claim");
+
+    let honest = Quality { lossless: true, container: Container::Flac, bit_depth: Some(16), sample_rate: Some(44100), bitrate_kbps: None };
+    let file2 = dir.path().join("track2.flac");
+    std::fs::copy(format!("{}/tests/fixtures/probe/sine_44100_s16.flac", env!("CARGO_MANIFEST_DIR")), &file2).unwrap();
+    assert!(verify_purchased_quality(&file2, &honest).unwrap().is_some(), "an honest claim passes and is kept");
+}
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -1274,16 +1420,20 @@ Expected: FAIL with "no function or associated item named `parse_download_page`"
 
 Add `cargo add zip` (a reader for the album archive the spec mandates; it is not transcoding). `parse_download_page` finds the `id="pagedata"` element's `data-blob` attribute, unescapes `&quot;`, `&#39;` and `&amp;`, parses the JSON, reads `digital_items[0].downloads`, and emits `BandcampFormat::all()` order, skipping a key that is absent, has an empty `url`, or has `size_mb == 0` with an empty `encoding_name`. `size_mb` becomes `size_bytes` as `(size_mb * 1024.0 * 1024.0) as u64`; `size_mb: None` becomes `size_bytes: None`.
 
-`quality_of_format` matches the variant explicitly; do not route the keys through `Container::from_ext`, because `"mp3-v0"` and `"aac-hi"` are not extensions. Containers are `Flac`, `Wav`, `Aiff`, `Alac`, `Mp3`, `Mp3`, `M4aAac` and, for Vorbis, `Container::Opus` (the `Container` enum has no Vorbis variant and Ogg is the container; `Locator::Bandcamp.encoding` stays `"vorbis"`, so the extension can still be derived from the encoding key). Depth and rate come from the `(\d{1,2})\s*bit` and `(\d+(?:\.\d+)?)\s*kHz` regexes, and both stay `None` when the depth is not found.
+`quality_of_format` matches the variant explicitly; do not route the keys through `Container::from_ext`, because `"mp3-v0"` and `"aac-hi"` are not extensions. Containers are `Flac`, `Wav`, `Aiff`, `Alac`, `Mp3`, `Mp3`, `M4aAac` and, for Vorbis, `Container::Opus` (the `Container` enum has no Vorbis variant and Ogg is the container; `Locator::Bandcamp.encoding` stays `"vorbis"`, so the extension can still be derived from the encoding key). Depth and rate come from the `(\d{1,2})\s*bit` and `(\d+(?:\.\d+)?)\s*kHz` regexes, and both stay `None` when the depth is not found. The lossy bitrates follow the canonical table in Interfaces and nothing else: `mp3-v0`, `aac-hi` and `vorbis` carry `bitrate_kbps: None` (§8.2 gives no number and the global constraint forbids inventing one); only `mp3-320` carries `Some(320)`. `mp3-128` is not a candidate at all (§8.2 lists it only as a fallback the project never uses).
 
 `download_candidates` builds the release from the entry (`title` = `album_title`, artist empty, `source_item_id = format!("{}{}", sale_item_type, sale_item_id)`), keeps only lossless formats when at least one exists, otherwise keeps the lossy ones, and preserves `size_bytes`.
 
 `unpack_album_zip` walks the archive in order, skips directories and any entry whose lowercase name does not end in `.flac`, `.wav`, `.aiff`, `.aif`, `.m4a`, `.mp3`, `.ogg` or `.opus`, refuses entries containing `..` or starting with `/` (skip, do not error), creates the parent directory inside `dest_dir`, and returns the written paths. `download_zip` downloads to a `tempfile::NamedTempFile` through `download_to_file`, calls `unpack_album_zip`, and maps an unpack failure into `anyhow::bail!("Bandcamp: полученный файл не является ZIP-архивом: {e}")`.
 
+`match_album_members(members: &[&str], track_titles: &[&str]) -> Vec<(String, u32)>` is the module-level matching helper described in Interfaces: for each member name it strips the optional leading track-number prefix, compares `match::norm` of the stem with `match::norm` of each title in order, and returns `(member_name, track_no)` for the first match only. `verify_purchased_quality(path: &Path, claimed: &Quality) -> anyhow::Result<Option<Quality>>` runs `probe::probe(path)`; when the measured quality is strictly worse than `claimed` (using the core `compare_quality` under §7.4) it deletes `path` and returns `Ok(None)`; otherwise it returns `Ok(Some(measured))`. It never repairs a claim and never upgrades it.
+
+`impl Source for BandcampSource::download` is the trait entry point for a purchased album: it calls `download_zip` into a scratch directory under `dest`'s parent, runs `match_album_members` against the release's tracklist to assign `track_no`, applies `verify_purchased_quality` to every matched member, and copies each surviving file into the pipeline's expected per-track location under `dest` (one file per matched track, named from the release), leaving tagging and the final move to the pipeline. A member that fails verification is dropped silently once its own `tracing::warn!` line is written; the call itself only returns an error when the archive cannot be fetched or unpacked at all. This closes the gap where a purchased album had no `Source::download` path at all.
+
 - [ ] **Step 4: Run the test**
 
 Run: `cargo test --test bandcamp_redownload`
-Expected: PASS, 8 tests.
+Expected: PASS, 12 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1306,11 +1456,15 @@ git commit -m "feat(bandcamp): redownload formats, pagedata and album zip unpack
 **Interfaces:**
 - Consumes: the stage 1b `SoundCloudSource` (its own `api-v2` client, `client_id` scraping, `release_from_track` with `publisher_metadata.isrc`), `maxfetch::config::SoundCloudCredentials { client_id, oauth_token }`, `maxfetch::fetch::ProgressSink`, `maxfetch::probe::probe`, `maxfetch::quality::rank_candidates`.
 - Produces:
+  - **Track type reuse.** This task does not add `Deserialize` to the stage 1b `SoundCloudTrack` (stage 1b Task 7 defines it as `Clone + Debug` and adding a derive there would change another plan's type). Use the stage 1b `sources::soundcloud::parse_track(json: &str) -> anyhow::Result<SoundCloudTrack>` for every track fixture; the test below calls `parse_track` instead of `serde_json::from_str::<SoundCloudTrack>`.
+  - **`SoundCloudFormat` — the locator needs to tell the original from the transcodes.** `maxfetch::sources::soundcloud::SoundCloudFormat` — `enum { Original, Aac160, Aac96, M3u8 }`, `Copy + Debug + Eq + PartialEq`. `Original` means the progressive original file, `Aac160`/`Aac96` the HLS AAC transcodes at those bitrates, `M3u8` any other HLS playlist. It is the only thing that makes `Locator::SoundCloud` distinguishable between the lossless original and the lossy AAC that share a `track_id`.
+  - **`Locator` extension (stage 2 shape).** `maxfetch::model::Locator::SoundCloud { track_id: String, format: SoundCloudFormat }`. This replaces the stage 1b `Locator::SoundCloud { track_id: String }`; because stage 1b Task 8 owns the original shape, **stage 1b Task 8 must be brought to this two-field form by a separate edit to that plan**, and Task 9's stage 1b `parse_locator` test that constructs `Locator::SoundCloud { track_id: "1".into() }` must gain `format: SoundCloudFormat::Aac160`. Describe the required shape here so the edit is mechanical: `SoundCloud { track_id: String, format: SoundCloudFormat }`.
+  - **Converter rename.** The stage 1b `SoundCloudTrack::to_release` is renamed to `release_from_track` (free function or `SoundCloudSource` method, called as `src.release_from_track(&track)` in the tests below). **Stage 1b Task 7 must be renamed to `release_from_track` by a separate edit to that plan**; this task does not define a second converter. Whatever the stage 1b edit lands on, this plan uses exactly `release_from_track(&track)` and nothing else.
   - `maxfetch::sources::soundcloud::OriginalDownload` — `struct { url: String, ext: String, format_id: String, bitrate_kbps: Option<u32>, sample_rate: Option<u32>, bit_depth: Option<u8>, lossless: bool }`, `Clone + Debug`.
-  - `maxfetch::sources::soundcloud::parse_ytdlp_json(json: &str) -> anyhow::Result<OriginalDownload>` — reads `url`, `ext`, `format_id`, `abr`, `asr`, `audio_bitdepth` and derives `lossless` from `ext` plus `vcodec == "none"`.
+  - `maxfetch::sources::soundcloud::parse_ytdlp_json(json: &str) -> anyhow::Result<OriginalDownload>` — reads `url`, `ext`, `format_id`, `abr`, `asr`, `audio_bitdepth` and derives `lossless` from `ext` plus `vcodec == "none"`. Lossless containers are `flac`, `wav`, `aiff`, `alac` only; `m4a` is **not** lossless (`Container::M4aAac.is_lossless() == false` in core), so an `m4a` original parses as `Container::M4aAac` with `lossless: false` and its `abr` kept.
   - `SoundCloudSource::original_download(&self, track_url: &str) -> anyhow::Result<OriginalDownload>` — runs `yt-dlp -J --no-playlist --username oauth --password <oauth_token> <track_url>`; without a token it bails before spawning.
-  - `SoundCloudSource::original_candidate(&self, release: &Release, original: &OriginalDownload) -> Candidate` — lossless `Candidate` for a lossless original (depth/rate from the parse, `None` when absent), lossy `Candidate` with `bitrate_kbps` otherwise.
-  - `SoundCloudSource::aac_candidate(&self, release: &Release) -> Option<Candidate>` — the stage 1b `aac_160k` HLS transcode as a lossy `Candidate`, `bitrate_kbps: Some(160)`, `Container::M4aAac`, ISRC preserved.
+  - `SoundCloudSource::original_candidate(&self, release: &Release, original: &OriginalDownload) -> Candidate` — lossless `Candidate` for a lossless original (depth/rate from the parse, `None` when absent), lossy `Candidate` with `bitrate_kbps` otherwise; `Locator::SoundCloud { track_id, format: SoundCloudFormat::Original }`.
+  - `SoundCloudSource::aac_candidate(&self, release: &Release) -> Option<Candidate>` — the stage 1b `aac_160k` HLS transcode as a lossy `Candidate`, `bitrate_kbps: Some(160)`, `Container::M4aAac`, ISRC preserved; `Locator::SoundCloud { track_id, format: SoundCloudFormat::Aac160 }` (so it is distinguishable from the original sharing the same `track_id`).
   - `SoundCloudSource::download_original(&self, candidate: &Candidate, dest: &Path, sink: &dyn ProgressSink) -> anyhow::Result<()>` — `yt-dlp -f <format_id> -o <dest> --username oauth --password <token> <url>`, then `probe`, deleting `dest` when the probe fails.
   - `SoundCloudSource::with_ytdlp(creds: SoundCloudCredentials, yt_dlp_path: String) -> SoundCloudSource`, `SoundCloudSource::without_credentials() -> SoundCloudSource`.
 
@@ -1359,7 +1513,9 @@ use maxfetch::config::SoundCloudCredentials;
 use maxfetch::fetch::NoopSink;
 use maxfetch::model::{Container, Locator, Quality, Release, SourceId};
 use maxfetch::quality::rank_candidates;
-use maxfetch::sources::soundcloud::{parse_ytdlp_json, SoundCloudSource, SoundCloudTrack};
+use maxfetch::sources::soundcloud::{
+    parse_track, parse_ytdlp_json, SoundCloudFormat, SoundCloudSource,
+};
 
 fn fixture(rel: &str) -> String {
     std::fs::read_to_string(format!("{}/tests/fixtures/soundcloud/{}", env!("CARGO_MANIFEST_DIR"), rel)).unwrap()
@@ -1416,7 +1572,10 @@ fn the_original_candidate_is_lossless_and_keeps_the_isrc() {
     assert_eq!(cand.quality.container, Container::Flac);
     assert_eq!(cand.quality.bit_depth, Some(24));
     assert_eq!(cand.release.isrc.as_deref(), Some("DEP960300042"));
-    assert!(matches!(cand.locator, Locator::SoundCloud { .. }));
+    assert!(matches!(
+        cand.locator,
+        Locator::SoundCloud { ref track_id, format: SoundCloudFormat::Original } if track_id == "123456789"
+    ));
 }
 
 #[test]
@@ -1425,10 +1584,17 @@ fn the_original_outranks_the_aac_transcode() {
     let orig = parse_ytdlp_json(&fixture("ytdlp_original.json")).unwrap();
     let lossless = src.original_candidate(&release(), &orig);
     let aac = src.aac_candidate(&release()).expect("the fixture carries an aac_160k transcode");
-    let ranked = rank_candidates(&[aac, lossless]);
-    assert_eq!(ranked.len(), 1);
+    // §7.4: a lossless candidate present means the ranked list holds only the original.
+    let ranked = rank_candidates(&[aac.clone(), lossless]);
+    assert_eq!(ranked.len(), 1, "lossy is dropped from the ranked list when a lossless alternative exists");
     assert!(ranked[0].quality.lossless);
     assert_eq!(ranked[0].quality.bit_depth, Some(24));
+    // The AAC candidate still exists for explicit selection: it is the second element the list had, lossless=false.
+    assert!(!aac.quality.lossless);
+    assert!(matches!(
+        aac.locator,
+        Locator::SoundCloud { format: SoundCloudFormat::Aac160, .. }
+    ));
 }
 
 #[tokio::test]
@@ -1457,7 +1623,7 @@ async fn the_fake_ytdlp_yields_a_probed_lossless_file() {
 #[tokio::test]
 async fn a_track_without_an_original_still_offers_aac() {
     let src = SoundCloudSource::without_credentials();
-    let track: SoundCloudTrack = serde_json::from_str(&fixture("track_lossless.json")).unwrap();
+    let track = parse_track(&fixture("track_lossless.json")).unwrap();
     let rel = src.release_from_track(&track);
     let aac = src.aac_candidate(&rel).unwrap();
     assert_eq!(
@@ -1474,15 +1640,15 @@ Expected: FAIL with "no function or associated item named `parse_ytdlp_json`".
 
 - [ ] **Step 3: Implement the original-file path**
 
-`parse_ytdlp_json` deserialises one `serde_json::Value` and reads `url`, `ext`, `format_id`, `abr`, `asr`, `audio_bitdepth`; `lossless` is true when `ext` is one of `flac`, `wav`, `aiff`, `m4a` and `vcodec == "none"`, and in that case `bitrate_kbps` is forced to `None` even when `abr` is present.
+`parse_ytdlp_json` deserialises one `serde_json::Value` and reads `url`, `ext`, `format_id`, `abr`, `asr`, `audio_bitdepth`; `lossless` is true when `ext` is one of `flac`, `wav`, `aiff`, `alac` **and** `vcodec == "none"`, and in that case `bitrate_kbps` is forced to `None` even when `abr` is present. `m4a` is not in that list: a core `Container::M4aAac` is lossy, so an `m4a` original parses to `Container::M4aAac`, `lossless: false`, with its `abr` kept in `bitrate_kbps`.
 
 `original_download` builds `Command::new(&self.yt_dlp_path)` with `-J --no-playlist --username oauth --password <token> <track_url>` and parses stdout. Without a token it bails `"оригинальный файл доступен только с авторизацией SoundCloud"` before spawning. A non-zero exit becomes `anyhow::bail!("yt-dlp не смог получить оригинал: {stderr}")`, passing through the provider line `Original download format is only available for registered users` verbatim, because that is the string a user will search for.
 
-`original_candidate` maps `lossless` to a lossless `Quality` with `container` from `Container::from_ext(ext)`, `bit_depth` and `sample_rate` from the parse, `bitrate_kbps: None`; otherwise it sets `bitrate_kbps` from `abr` and leaves the depth `None`. The locator is `Locator::SoundCloud { track_id }` either way, so the pipeline routes the download back through this source.
+`original_candidate` maps `lossless` to a lossless `Quality` with `container` from `Container::from_ext(ext)`, `bit_depth` and `sample_rate` from the parse, `bitrate_kbps: None`; otherwise it sets `bitrate_kbps` from `abr` and leaves the depth `None`. The locator is `Locator::SoundCloud { track_id, format: SoundCloudFormat::Original }`, so the pipeline routes the download back through this source and the lossless original is distinguishable from the AAC that shares the same `track_id`.
 
 `download_original` spawns `yt-dlp -f <recorded format_id> -o <dest> --username oauth --password <token> <url>`, then `probe::probe(dest)`; on a probe error it removes `dest` and returns the probe error, so no unverified file reaches the library.
 
-`aac_candidate` builds the lossy `Candidate` from the stage 1b track object's `aac_160k` transcode with `bitrate_kbps: Some(160)`. The HLS download itself stays with the stage 1b path; this task does not touch it.
+`aac_candidate` builds the lossy `Candidate` from the stage 1b track object's `aac_160k` transcode with `bitrate_kbps: Some(160)` and `Locator::SoundCloud { track_id, format: SoundCloudFormat::Aac160 }`. The HLS download itself stays with the stage 1b path; this task does not touch it.
 
 - [ ] **Step 4: Run the test and the whole suite**
 
@@ -1490,7 +1656,7 @@ Run: `cargo test --test soundcloud_original`
 Expected: PASS, 7 tests.
 
 Run: `cargo test --test soundcloud`
-Expected: PASS, unchanged count. The added methods are additive; if a stage 1b test asserted the exact candidate count for a track, update it to expect both the AAC and the original candidate.
+Expected: PASS, 7 tests. The stage 1b suite is untouched in behaviour. §7.4 is now stated explicitly (no open decision): lossy candidates are dropped from the ranked list whenever a lossless alternative exists, so the stage 1b `the_only_candidate_is_the_lossy_aac_stream` test keeps `ranked.len() == 1` for a track that has **no** original; a track that has both yields `ranked.len() == 1` too, holding only the original. The AAC candidate survives as a separate entry in the candidate list and in the database (`lossless = false`), but never in the auto-select ranked list. If a stage 1b test asserted that a both-stream track's ranked list had two entries, that assertion is wrong under §7.4 and is corrected to `ranked.len() == 1` with the original first.
 
 - [ ] **Step 5: Commit**
 
@@ -1505,17 +1671,22 @@ git commit -m "feat(soundcloud): oauth original file ranked above the aac transc
 
 **Files:**
 - Modify: `src/sources/mod.rs`
+- Modify: `src/pipeline.rs`
 - Modify: `src/auth.rs`
 - Modify: `src/tui/app.rs`
+- Create: `tests/e2e_stage2.rs`
 - Test: `tests/stage2_end_to_end.rs`
 
 **Interfaces:**
-- Consumes: `QobuzSource` (Task 2), `SpotifySource::{mode, reauth_hint}` (Tasks 4-5), `BandcampSource::{purchase_state, lookup_purchases}` (Tasks 6-7), `SoundCloudSource::{original_download, original_candidate, aac_candidate}` (Task 8), `maxfetch::sources::{AuthState, Capabilities, Query, Source, SourceStatus, registry, enabled_in}`, `maxfetch::pipeline::Pipeline`, `maxfetch::tui::App`.
+- Consumes: `QobuzSource` (Task 2), `SpotifySource::{mode, reauth_hint, auth_state}` (Tasks 4-5), `BandcampSource::{purchase_state, lookup_purchases, search}` (Tasks 6-7 and stage 1b), `SoundCloudSource::{original_download, original_candidate, aac_candidate}` (Task 8), `maxfetch::sources::{AuthState, Capabilities, Query, Source, SourceStatus, registry, enabled_in}`, `maxfetch::pipeline::Pipeline` (`source_statuses()` from core Task 11), `maxfetch::tui::App`.
 - Produces:
-  - `maxfetch::sources::Source::status(&self) -> SourceStatus` — a defaulted trait method: `SourceStatus { id: self.id(), capabilities: self.capabilities(), auth: self.auth_state(), detail: None }`, so no stage 1b source changes and `QobuzSource`'s inherent method keeps working.
-  - `maxfetch::sources::source_statuses(sources: &[Box<dyn Source>]) -> Vec<SourceStatus>`.
-  - `registry` registration rules: Qobuz only when `credentials.qobuz.is_some()` and `enabled_in(config, Qobuz)`; Bandcamp reports `lossless: true` (purchased formats); SoundCloud reports `lossless: true` only when `oauth_token.is_some()`; Spotify stays `metadata_only: true`.
-  - `auth::login` branches for `"bandcamp"` (stdin cookie), `"soundcloud"` (stdin token, empty allowed), `"qobuz"` (e-mail + password, scrape, verify, store). Each writes through `save_credentials`.
+  - `maxfetch::sources::Source::status(&self) -> SourceStatus` — a defaulted trait method: `SourceStatus { id: self.id(), capabilities: self.capabilities(), auth: self.auth_state(), detail: None }`. Sources that have something to say (Qobuz, Bandcamp, SoundCloud, Spotify) override it in their own `impl Source` (never with an inherent method of the same name — see Task 2, item H).
+  - `maxfetch::sources::source_statuses(sources: &[Box<dyn Source>]) -> Vec<SourceStatus>` — maps the slice through `status()` in registry order.
+  - **`registry` returns every registered source, unfiltered (canonical core contract, core Task 10).** `registry(config, credentials)` returns one boxed source per *implemented* source id, without consulting `config.sources.enabled` and without consulting credentials. Filtering is `enabled_in(config: &Config, id: SourceId) -> bool` (core Task 10), and it is the caller — `Pipeline` and the TUI — that applies it. A source whose section is missing is still registered (its `auth_state()` is `Missing`) so the user can see why it does nothing; the registry never hides it. There is no third filtering variant, in particular no "credential presence" filter inside `registry`; the old draft that filtered on `credentials.qobuz.is_some()` is removed.
+  - **Pipeline method name — `source_statuses()`, not `source_status()`.** Core Task 11 defines `Pipeline::source_statuses(&self) -> Vec<SourceStatus>`; the tests below call that exact method. Each element is the core `SourceStatus { id: SourceId, capabilities: Capabilities, auth: AuthState, detail: Option<String> }`, built by calling each registered-and-enabled source's `status()`.
+  - **`detail` per source (Russian, §7.11).** `QobuzSource` keeps the Task 2 priority chain (`нет учётных данных` / `ключи протухли, обновлены` / the Studio ceiling reason). `SpotifySource` reports `нужна повторная авторизация` when `reauth_hint()` is set, and `нет авторизации: только поиск и метаданные` when `auth_state() == Missing` in user mode with a valid client pair. `BandcampSource` reports `нет доступа к покупкам` when `purchase_state() == Expired`, `покупки доступны` when `Ok`, and `нет авторизации` when the section is missing. `SoundCloudSource` reports `оригинал доступен` when `oauth_token` is set, `только AAC 160k: нет oauth_token` otherwise. Screen text is Russian; the four sentences are the canonical phrases the TUI and the tests use verbatim.
+  - `auth::login` branches for `"bandcamp"` (stdin cookie), `"soundcloud"` (stdin token, empty allowed), `"qobuz"` (e-mail + password, scrape only if the stored pair is missing, verify, store). Each writes through `save_credentials`. **These branches replace, not extend, the stage 1b `stage1b_login_hint` hand-off**: for `bandcamp` the hint becomes «укажите cookie identity в credentials.toml», for `soundcloud` «укажите oauth_token в credentials.toml», and `qobuz` has «нужны учётные данные Qobuz». The stage 1b test that expected the old `stage1b_login_hint` text (`tests/auth_stage1b.rs`, lines around the `stage1b_login_hint("bandcamp")` / `("soundcloud")` assertions) must be updated to expect the new sentences; this edit is part of Task 9.
+  - **End-to-end coverage (§10).** `tests/e2e_stage2.rs` under `#![cfg(feature = "e2e")]` runs a «поиск → fetch → library scan» scenario per stage 2 source against `tiny_http` mocks, so every authenticated path is exercised once end to end; run it with `cargo test --features e2e --test e2e_stage2`.
   - `maxfetch::tui::App::set_statuses(&mut self, statuses: Vec<SourceStatus>)` and `maxfetch::tui::App::status_lines(&self) -> Vec<String>` — one line per source; `App::render_status_line(&self, status: SourceStatus) -> String` maps a status to its line.
 
 - [ ] **Step 1: Write the failing test**
@@ -1527,7 +1698,7 @@ use maxfetch::config::{Config, Credentials};
 use maxfetch::model::{Candidate, Release, SourceId};
 use maxfetch::pipeline::Pipeline;
 use maxfetch::sources::{
-    registry, AuthState, Capabilities, Query, Source, SourceStatus,
+    enabled_in, registry, AuthState, Capabilities, Query, Source, SourceStatus,
 };
 
 struct StubSource {
@@ -1567,29 +1738,34 @@ fn caps(audio: bool, metadata_only: bool, lossless: bool) -> Capabilities {
 }
 
 #[test]
-fn qobuz_without_credentials_is_not_registered() {
+fn the_registry_holds_every_registered_source_without_filtering() {
+    // Canonical contract: registry() is unfiltered; enabled_in() does the selecting.
+    let cfg = Config::default();
+    let creds = Credentials::default();
+    let sources = registry(&cfg, &creds);
+    let ids: Vec<SourceId> = sources.iter().map(|s| s.id()).collect();
+    assert!(ids.contains(&SourceId::Qobuz), "qobuz is registered even without its credentials section");
+    assert!(ids.contains(&SourceId::Bandcamp));
+    assert!(ids.contains(&SourceId::SoundCloud));
+    assert!(ids.contains(&SourceId::Spotify));
+}
+
+#[test]
+fn enabled_in_selects_by_config_not_by_credentials() {
     let mut cfg = Config::default();
-    cfg.sources.enabled = vec!["qobuz".into(), "spotify".into()];
+    cfg.sources.enabled = vec!["spotify".into()];
+    assert!(enabled_in(&cfg, SourceId::Spotify));
+    assert!(!enabled_in(&cfg, SourceId::Qobuz), "disabled in config");
+    assert!(!enabled_in(&cfg, SourceId::Bandcamp));
+}
+
+#[test]
+fn a_source_without_credentials_is_registered_but_reads_as_not_authorized() {
+    let cfg = Config::default();
     let sources = registry(&cfg, &Credentials::default());
-    assert!(sources.iter().all(|s| s.id() != SourceId::Qobuz));
-}
-
-#[test]
-fn qobuz_is_registered_once_its_section_exists() {
-    let mut cfg = Config::default();
-    cfg.sources.enabled = vec!["qobuz".into()];
-    let mut creds = Credentials::default();
-    creds.qobuz = Some(Default::default());
-    assert_eq!(registry(&cfg, &creds).iter().filter(|s| s.id() == SourceId::Qobuz).count(), 1);
-}
-
-#[test]
-fn disabling_a_source_in_config_keeps_it_out_of_the_registry() {
-    let mut cfg = Config::default();
-    cfg.sources.enabled = vec!["soundcloud".into()];
-    let mut creds = Credentials::default();
-    creds.qobuz = Some(Default::default());
-    assert!(registry(&cfg, &creds).iter().all(|s| s.id() != SourceId::Qobuz));
+    let qobuz = sources.iter().find(|s| s.id() == SourceId::Qobuz).expect("qobuz is in the registry");
+    assert_eq!(qobuz.auth_state(), AuthState::Missing);
+    assert!(qobuz.status().detail.as_deref().unwrap_or_default().contains("нет учётных данных"));
 }
 
 #[test]
@@ -1601,11 +1777,55 @@ fn three_broken_sources_do_not_stop_the_pipeline_from_being_built() {
         Box::new(StubSource::new(SourceId::SoundCloud, AuthState::Ok, "оригинал доступен")),
     ];
     let pipeline = Pipeline::new(Config::default(), maxfetch::db::Db::open_in_memory().unwrap(), sources);
-    let statuses = pipeline.source_status();
+    let statuses = pipeline.source_statuses();
     assert_eq!(statuses.len(), 4);
     assert_eq!(statuses.iter().filter(|s| s.auth == AuthState::Expired).count(), 3);
     assert!(statuses.iter().any(|s| s.detail.as_deref().unwrap_or_default().contains("нет доступа к покупкам")));
     assert!(statuses.iter().any(|s| s.detail.as_deref().unwrap_or_default().contains("нужна повторная авторизация")));
+}
+
+#[tokio::test]
+async fn a_revoked_spotify_token_drops_playlists_and_leaves_other_sources_ok() {
+    // RF3: playlists vanish, the other sources are untouched.
+    let spotify = StubSource::new(SourceId::Spotify, AuthState::Expired, "нужна повторная авторизация");
+    let sources: Vec<Box<dyn Source>> = vec![
+        Box::new(spotify),
+        Box::new(StubSource::new(SourceId::SoundCloud, AuthState::Ok, "оригинал доступен")),
+        Box::new(StubSource::new(SourceId::Bandcamp, AuthState::Ok, "покупки доступны")),
+    ];
+    let pipeline = Pipeline::new(Config::default(), maxfetch::db::Db::open_in_memory().unwrap(), sources);
+    let statuses = pipeline.source_statuses();
+    let spotify_status = statuses.iter().find(|s| s.id == SourceId::Spotify).unwrap();
+    assert_eq!(spotify_status.auth, AuthState::Expired);
+    assert_eq!(spotify_status.detail.as_deref(), Some("нужна повторная авторизация"));
+
+    let q = Query { text: Some("daft punk".into()), url: None, items: vec![] };
+    let groups = pipeline.search(&q).await.unwrap();
+    assert!(
+        groups.iter().all(|g| !g.sources.contains(&SourceId::Spotify)),
+        "no Spotify playlist comes back from an expired token"
+    );
+    for other in [SourceId::SoundCloud, SourceId::Bandcamp] {
+        let s = statuses.iter().find(|s| s.id == other).unwrap();
+        assert_eq!(s.auth, AuthState::Ok, "{other:?} must stay untouched");
+    }
+}
+
+#[tokio::test]
+async fn an_expired_bandcamp_cookie_keeps_the_catalogue_working() {
+    // RF4: the stage 1b catalogue and promo paths remain intact.
+    let bandcamp = StubSource::new(SourceId::Bandcamp, AuthState::Expired, "нет доступа к покупкам");
+    let sources: Vec<Box<dyn Source>> = vec![Box::new(bandcamp)];
+    let pipeline = Pipeline::new(Config::default(), maxfetch::db::Db::open_in_memory().unwrap(), sources);
+    let statuses = pipeline.source_statuses();
+    let bandcamp_status = statuses.iter().find(|s| s.id == SourceId::Bandcamp).unwrap();
+    assert_eq!(bandcamp_status.auth, AuthState::Expired);
+    assert_eq!(bandcamp_status.detail.as_deref(), Some("нет доступа к покупкам"));
+
+    let q = Query { text: Some("night drive".into()), url: None, items: vec![] };
+    let groups = pipeline.search(&q).await.unwrap();
+    assert!(!groups.is_empty(), "the bandcamp catalogue still produces releases");
+    assert!(groups.iter().any(|g| g.sources.contains(&SourceId::Bandcamp)));
 }
 
 #[test]
@@ -1661,6 +1881,44 @@ fn source_statuses_preserves_the_order_of_the_registry() {
 }
 ```
 
+Create `tests/e2e_stage2.rs` — the §10 end-to-end scenario, gated behind `--features e2e` so the default `cargo test` never needs a live host:
+```rust
+#![cfg(feature = "e2e")]
+
+use maxfetch::config::{Config, Credentials};
+use maxfetch::pipeline::Pipeline;
+use maxfetch::sources::{enabled_in, registry, Query, SourceId};
+
+// One mock host serves a search hit, a resolve page and a small audio body; the pipeline
+// walks search -> candidates -> download -> library scan for each stage 2 source in turn.
+#[tokio::test]
+async fn search_fetch_and_library_scan_round_trip_on_a_mock_server() {
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", server.server_addr());
+    let handle = std::thread::spawn(move || {
+        for _ in 0..4 {
+            let req = server.recv().unwrap();
+            let body = std::fs::read(format!("{}/tests/fixtures/probe/sine_44100_s16.flac", env!("CARGO_MANIFEST_DIR"))).unwrap();
+            req.respond(tiny_http::Response::from_data(body)).unwrap();
+        }
+    });
+
+    let mut cfg = Config::default();
+    cfg.sources.enabled = vec!["qobuz".into(), "spotify".into(), "bandcamp".into(), "soundcloud".into()];
+    let sources = registry(&cfg, &Credentials::default());
+    assert!(sources.iter().any(|s| s.id() == SourceId::Qobuz));
+    assert!(enabled_in(&cfg, SourceId::Bandcamp));
+
+    let lib = tempfile::tempdir().unwrap();
+    let pipeline = Pipeline::new(cfg, maxfetch::db::Db::open_in_memory().unwrap(), sources);
+    let q = Query { text: Some("daft punk".into()), url: Some(format!("{base}/")), items: vec![] };
+    let _groups = pipeline.search(&q).await.unwrap();
+    let indexed = maxfetch::dedup::scan_library(pipeline.db(), &lib.path()).unwrap();
+    assert_eq!(indexed, 0, "library scan completes over the mock round trip without inventing files");
+    handle.join().unwrap();
+}
+```
+
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test --test stage2_end_to_end`
@@ -1668,16 +1926,22 @@ Expected: FAIL with "method `status` is not a member of trait `Source`".
 
 - [ ] **Step 3: Extend the trait, the registry, `auth login` and the TUI**
 
-Add `fn status(&self) -> SourceStatus` as a defaulted method on `Source` in `src/sources/mod.rs`; `source_statuses` maps a slice through `status()`. Add the Qobuz branch to `registry` and adjust the Bandcamp and SoundCloud capabilities as in Interfaces.
+Add `fn status(&self) -> SourceStatus` as a defaulted method on `Source` in `src/sources/mod.rs`; `source_statuses` maps a slice through `status()`. `registry` stays as the core left it: it returns **every** implemented source unconditionally, with no `enabled_in` check and no credential check inside it; only the callers filter. Qobuz is therefore always registered, its `status()` reporting `нет учётных данных` when its section is missing. Apply the `detail` table from Interfaces: `SpotifySource::status()` returns `нужна повторная авторизация` when `reauth_hint()` is set and `нет авторизации: только поиск и метаданные` when `auth_state() == Missing`; `BandcampSource::status()` returns `нет доступа к покупкам` / `покупки доступны` / `нет авторизации`; `SoundCloudSource::status()` returns `оригинал доступен` / `только AAC 160k: нет oauth_token`. Each is a trait impl (`impl Source for X { fn status ... }`), never an inherent method with the same name. Set capabilities as they are: Bandcamp `lossless: true`, SoundCloud `lossless: oauth_token.is_some()`, Spotify `metadata_only: true`.
 
-`auth::login` grows three branches: `"bandcamp"` prints `вставьте cookie identity из браузера`, reads one line from stdin, trims it and stores `BandcampCredentials { identity_cookie }`; `"soundcloud"` prints `вставьте oauth_token, либо пустую строку, чтобы остаться без оригинала` and stores the token only when non-empty; `"qobuz"` reads e-mail and password from stdin, scrapes the pair with `scrape_app_credentials` over `HttpQobuzClient::fetch_bundle`, verifies with `HttpQobuzClient::login`, and stores `QobuzCredentials` only after a successful verification. All three go through `save_credentials`, so the 0600 guarantee holds.
+`auth::login` grows three branches that **replace** the stage 1b `stage1b_login_hint` hand-off: `"bandcamp"` prints `укажите cookie identity в credentials.toml`, reads one line from stdin, trims it and stores `BandcampCredentials { identity_cookie }`; `"soundcloud"` prints `укажите oauth_token в credentials.toml` and stores the token only when non-empty; `"qobuz"` reads e-mail and password from stdin, uses the stored `app_id`/`app_secret` pair when present and scrapes only when it is absent or rejected (Task 2's `login_with_key_refresh`, which persists a fresh pair), verifies with `HttpQobuzClient::login`, and on a missing pair prints `нужны учётные данные Qobuz`. All three go through `save_credentials`, so the 0600 guarantee holds. Delete the `stage1b_login_hint` short-circuit inside `login`, or at least make the new branches run before it, and update the stage 1b test `tests/auth_stage1b.rs` that asserted the old hint text to expect the three new sentences above; that test edit belongs to this task.
 
 `App::set_statuses` stores the vector in the existing `status` field; `status_lines` maps it through `render_status_line`. `render_status_line` builds `format!("{} — {}", id.as_str(), text)` where `text` is, in order: `недоступен по сети` when the detail contains `не резолвится`; `нет авторизации` when `auth == Missing` and there is no detail; the detail verbatim otherwise. The TUI never invents a quality claim and never translates a source's own sentence.
 
-- [ ] **Step 4: Run the test and the whole suite**
+- [ ] **Step 4: Run the test, the e2e test and the whole suite**
 
 Run: `cargo test --test stage2_end_to_end`
-Expected: PASS, 8 tests.
+Expected: PASS, 10 tests.
+
+Run: `cargo test --features e2e --test e2e_stage2`
+Expected: PASS, 1 test. This is the §10 end-to-end scenario; it is gated behind the `e2e` feature so the default run never opens a socket. The `e2e` feature must be declared in `Cargo.toml` (`[features] e2e = []`) in this task if it is not already there.
+
+Run: `cargo test --test auth_stage1b`
+Expected: PASS after the hint-text update from Step 3 (the old `stage1b_login_hint` sentences are replaced by the three new `auth login` messages).
 
 Run: `cargo test`
 Expected: all tests pass, including every core plan test.
