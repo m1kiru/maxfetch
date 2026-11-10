@@ -34,7 +34,7 @@ Stage-specific:
 - A quality tier the account has no subscription for must never be reported as lossless at face value. Tidal tiers 2 and 3 without HiFi are served at CD quality at best (HI_RES becomes `lossless: true` with `bit_depth: Some(16)`, `sample_rate: Some(44100)`; LOSSLESS becomes the same CD FLAC), and the detail string says the HiFi subscription is not active. Deezer's HiFi tier without the subscription becomes `Quality { lossless: false, .. }` (MP3 128) and the detail string says so.
 - `md-5` 0.10 is an extension of the crate list in spec §8.7: the spec names `deezer-client` 0.1.4, `blowfish` 0.10 and `aes` 0.9 only, and the Deezer key derivation needs MD5. Spec §8.7 is amended with `md-5` 0.10 in a separate change; until then this plan is the place that records the extra crate.
 - Beatport candidates are always created with `Quality::default()`-shaped values (lossless flag `false`, all numeric fields `None`) unless a `probe` has already run; the real quality is written only after `probe` measure it, per core Task 11.
-- All three sources are registered unconditionally in `sources::registry`, and `registry` returns every implemented source without filtering; whether a source runs is decided by `config.sources.enabled` through `sources::enabled_ids` (which delegates to the core `enabled_in`) and by the credentials section, never by the network state at build time. An unreachable source returns an empty result and an `Expired`/`Ok` status with a Russian `detail`.
+- All three sources are registered unconditionally in `sources::registry`, and `registry` returns every implemented source without filtering; whether a source runs is decided by `config.sources.enabled` through the core `sources::enabled_in` and by the credentials section, never by the network state at build time. An unreachable source returns an empty result and an `Expired`/`Ok` status with a Russian `detail`.
 - Fixtures live under `tests/fixtures/{tidal,deezer,beatport}/` and are committed. They contain no live tokens, no `arl` and no password; they are recorded shapes with obviously fake values.
 
 ## Review Focus
@@ -1168,7 +1168,7 @@ git commit -m "feat(sources): beatport user-auth download for purchased tracks"
 - Consumes: `maxfetch::sources::{registry, enabled_in, AuthState, Source, SourceStatus}`, `maxfetch::config::{Config, Credentials, TidalCredentials, DeezerCredentials, BeatportCredentials}`.
 - Produces:
   - `maxfetch::sources::registry(config: &Config, credentials: &Credentials) -> Vec<Box<dyn Source>>` — returns every registered source and does no filtering at all: Soulseek, YouTube, Spotify, Bandcamp, SoundCloud, Qobuz, Tidal, Deezer, Beatport, in that order, regardless of `config.sources.enabled`. Construction never opens a socket; the token caches live inside the boxes.
-  - `maxfetch::sources::enabled_ids(ids: &[SourceId], config: &Config) -> Vec<SourceId>` — the filtering step, called by the pipeline and by the TUI before they use the registry: it keeps the ids for which the core predicate `maxfetch::sources::enabled_in(config, id) -> bool` is true. It is named `enabled_ids` and not `enabled_in` because core Task 10 already owns `enabled_in(config, id) -> bool` and an earlier stage plan calls it; two functions with one name in one module cannot coexist, and this plan does not rewrite the core or the earlier stages.
+  - `maxfetch::sources::enabled_in(ids: &[SourceId], config: &Config) -> Vec<SourceId>` — the single filtering step, called by the pipeline and by the TUI before they use the registry: it returns the entries of `ids` whose `is_enabled(id, config)` is true, preserving the input order. It is defined once in core Task 10 and this stage does not redefine or wrap it; there is no `enabled_ids` and no second selection function.
   - `maxfetch::sources::statuses(sources: &[Box<dyn Source>]) -> Vec<SourceStatus>` — one status per entry, with the Russian `detail` for a source without usable credentials («нет учётных данных Tidal», «нет учётных данных Beatport», «Deezer: нужна авторизация (cookie arl протухла)») or `None`.
   - Derive list the stage-3 credential structs must satisfy, because the registry clones them out of `Credentials` instead of mutating it: `TidalCredentials { client_id: String, client_secret: String }`, `DeezerCredentials { arl: String, secret: Option<String> }` and `BeatportCredentials { client_id: String, client_secret: String, username: String, password: String }` each derive `Clone + Debug + Default + PartialEq + Serialize + Deserialize`. `Clone` is what the registry needs (`credentials.tidal.clone().unwrap_or_default()`), `Default` is what `unwrap_or_default` needs, and `PartialEq` is what the round-trip tests in `tests/config.rs` and the stage-3 tests compare by value. Core Task 3 declares `Clone` on `Config` only; Task 9 adds these derives to the three structs if they are missing, and says so in the commit message. Tidal and Deezer already need the empty-string default for `AuthState::Missing`.
   - `maxfetch::auth::login(source: &str, credentials: &mut Credentials) -> anyhow::Result<()>` gains real branches: `"tidal"` asks for a `client_id`/`client_secret` pair on stdin and stores it; `"deezer"` asks for the `arl` cookie and the `[deezer] secret` used for key derivation; `"beatport"` asks for `client_id`/`client_secret`/`username`/`password`. Every branch prints its prompt in Russian and explains that the pair is the user's own.
@@ -1179,7 +1179,7 @@ Create `tests/sources_registry_stage3.rs`:
 ```rust
 use maxfetch::config::{BeatportCredentials, Config, Credentials, DeezerCredentials, TidalCredentials};
 use maxfetch::model::SourceId;
-use maxfetch::sources::{enabled_ids, registry, AuthState};
+use maxfetch::sources::{enabled_in, registry, AuthState};
 
 fn creds_all() -> Credentials {
     let mut c = Credentials::default();
@@ -1217,16 +1217,17 @@ fn the_registry_holds_every_source_and_filters_nothing() {
 }
 
 #[test]
-fn enabled_ids_is_the_only_filter() {
+fn enabled_in_is_the_only_filter() {
     let mut cfg = Config::default();
     cfg.sources.enabled = vec!["tidal".into(), "beatport".into()];
-    assert_eq!(enabled_ids(&all_ids(), &cfg), vec![SourceId::Tidal, SourceId::Beatport]);
+    assert_eq!(enabled_in(&all_ids(), &cfg), vec![SourceId::Tidal, SourceId::Beatport]);
 
     cfg.sources.enabled = vec!["deezer".into()];
-    assert_eq!(enabled_ids(&all_ids(), &cfg), vec![SourceId::Deezer]);
+    assert_eq!(enabled_in(&all_ids(), &cfg), vec![SourceId::Deezer]);
 
+    // An empty enabled list means "everything enabled", in the input order.
     cfg.sources.enabled = Vec::new();
-    assert!(enabled_ids(&all_ids(), &cfg).is_empty());
+    assert_eq!(enabled_in(&all_ids(), &cfg), all_ids());
 }
 
 #[test]
@@ -1244,13 +1245,13 @@ fn missing_credentials_do_not_remove_the_source() {
 - [ ] **Step 2: Run the test to verify it fails**
 
 Run: `cargo test --test sources_registry_stage3`
-Expected: FAIL with "no function or associated item named `enabled_ids`".
+Expected: FAIL with "unresolved import `maxfetch::sources::enabled_in`" (the registry entries for Tidal, Deezer and Beatport do not exist yet).
 
 - [ ] **Step 3: Implement the registry and the login branches**
 
 `registry` builds the `Vec<Box<dyn Source>>` in the fixed order Soulseek, YouTube, Spotify, Bandcamp, SoundCloud, Qobuz, Tidal, Deezer, Beatport and returns it as is; it never looks at `config.sources.enabled`. `TidalSource` is built from `credentials.tidal.clone().unwrap_or_default()`, `DeezerSource` from `credentials.deezer.clone().unwrap_or_default()`, `BeatportSource` from `credentials.beatport.clone()`. Cloning is why the three structs need the derives listed in Interfaces; the registry never mutates `Credentials`.
 
-`enabled_ids` is the filter the pipeline and the TUI apply on top of the registry result, so a disabled source is still visible in the Sources screen with its reason and simply does not participate in a run. It delegates to the core predicate `enabled_in(config, id)` for each id and preserves the input order.
+`enabled_in` is the filter the pipeline and the TUI apply on top of the registry result, so a disabled source is still visible in the Sources screen with its reason and simply does not participate in a run. It is the one defined in core Task 10: this stage adds no wrapper and no second name, and the pipeline calls it with the ids collected from `registry`.
 
 `auth::login` keeps the core "not implemented" fallback for sources outside this stage and switches on the `source` string for the three stage-3 ones. Each branch writes into `credentials` and calls the existing `save_credentials`, which writes mode 0600. The Tidal and Beatport branches tell the user, in Russian, that the pair is theirs to supply: nothing is prefilled with a published key.
 

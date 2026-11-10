@@ -1084,7 +1084,7 @@ git commit --author="m1kiru <m1kiru@github.com>" -m "feat(spotify): catalog sour
 - Produces:
   - `maxfetch::sources::registry(config: &Config, credentials: &Credentials) -> Vec<Box<dyn Source>>` — now returns three sources, always in the order Soulseek, YouTube, Spotify, regardless of `config.sources.enabled` (the pipeline filters on `enabled_in`). Construction never opens a socket: `SoulseekSource` connects on its first call, YouTube only stores the configured binary paths, Spotify builds `RspotifyApi` when both credentials are present and `UnconfiguredApi` otherwise.
   - `maxfetch::sources::source_checks(sources: &[Box<dyn Source>]) -> Vec<SourceStatus>` — one `SourceStatus` per source, with `detail` holding the Russian diagnosis: the Soulseek/Spotify credential hint when `auth_state` is `Missing`, the `youtube::binary_status` message when `yt-dlp` is absent, and `None` otherwise.
-  - `maxfetch::sources::enabled_in(ids: &[SourceId], config: &Config) -> Vec<SourceId>` — returns `ids` filtered by `config.sources.enabled`, preserving the input order. An empty `enabled` list means "everything enabled". This is the single filter the pipeline and the TUI use, so `registry` stays a pure constructor and no consumer re-implements the string matching.
+  - `maxfetch::sources::enabled_in(ids: &[SourceId], config: &Config) -> Vec<SourceId>` — returns `ids` filtered by `config.sources.enabled`, preserving the input order. An empty `enabled` list means "everything enabled". This is the single filter the pipeline and the TUI use, so `registry` stays a pure constructor and no consumer re-implements the string matching. Its per-id helper is `is_enabled(id: &SourceId, config: &Config) -> bool` (core Task 10); `enabled_in` is the only selection function, and there is no second name for it.
   - `maxfetch::sources::skip_reason(source: &dyn Source) -> Option<String>` — `Some("источник <id> пропущен: нет авторизации")` for `AuthState::Missing`, `Some("источник <id> пропущен: ключи протухли")` for `Expired`, `None` for `Ok` and `NotNeeded`.
 
 - [ ] **Step 1: Write the failing test**
@@ -1110,9 +1110,14 @@ fn a_disabled_source_is_still_registered_and_only_filtered_on_use() {
     assert_eq!(sources.len(), 3);
     let ids: Vec<SourceId> = sources.iter().map(|s| s.id()).collect();
     assert_eq!(enabled_in(&ids, &cfg), vec![SourceId::Soulseek]);
+    assert_eq!(enabled_in(&[], &cfg), Vec::<SourceId>::new());
 
     cfg.sources.enabled = vec!["youtube".into(), "spotify".into()];
     assert_eq!(enabled_in(&ids, &cfg), vec![SourceId::Youtube, SourceId::Spotify]);
+
+    // An empty enabled list means "everything enabled", in the input order.
+    cfg.sources.enabled = Vec::new();
+    assert_eq!(enabled_in(&ids, &cfg), ids);
     assert_eq!(registry(&cfg, &Credentials::default()).len(), 3);
 }
 
