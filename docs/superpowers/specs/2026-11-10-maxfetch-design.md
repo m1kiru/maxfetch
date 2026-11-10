@@ -419,8 +419,8 @@ path = "~/Music/maxfetch"
 enabled = ["soulseek", "bandcamp", "youtube", "spotify"]
 
 [matching]
-duration_tolerance_sec = 2.0     # MatchingConfig::duration_tolerance_sec, допуск по длительности при дедупе
-require_isrc = false
+duration_tolerance_sec = 2       # MatchingConfig::duration_tolerance_sec (u32), допуск по длительности при дедупе
+require_isrc = false             # MatchingConfig::require_isrc (bool)
 
 [download]
 max_concurrency = 4
