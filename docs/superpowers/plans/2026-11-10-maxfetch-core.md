@@ -33,11 +33,11 @@
 
 The spec is a vision document; these inputs are implied by it but not covered by any explicit requirement. Each has a test pinned to the task that owns the relevant code.
 
-1. **A "24/96 FLAC" that is really a 16/44.1 transcode.** The source claims more quality than the file delivers. Expected: the file is rejected after probing, the next-best candidate is tried, and the database only ever stores the quality measured from the file. Pinned to Task 6 (probe) and Task 11 (pipeline).
-2. **The same ISRC arriving from two different albums** (compilation vs. studio album). Expected: deduplication is global, the loser is marked `duplicate_of`, its file stays on disk untouched, and no album ends up with a hole in its tracklist. Pinned to Task 12 (dedup).
-3. **One source is unreachable or unauthorized while the others work.** Expected: the run continues, the failing source is reported as skipped with a reason, and the remaining sources still deliver the track. Pinned to Task 11 (pipeline).
-4. **Only lossy exists anywhere** for a track. Expected: the lossy file is kept as-is, never re-encoded, and carries the honest "источник lossy" marker in the tag comment, the database and the TUI badge. Pinned to Task 7 (tags) and Task 1 (ranking).
-5. **A Bandcamp album ZIP that contains 12 tracks but only 3 are wanted/downloaded.** Expected: the archive is unpacked, each track becomes its own candidate, the missing 9 are simply absent from the result, and the run is reported per track rather than failing the whole album. Pinned to Task 11 (pipeline).
+1. **A "24/96 FLAC" that is really a 16/44.1 transcode.** The source claims more quality than the file delivers. Expected: the file is rejected after probing, the next-best candidate is tried, and the database only ever stores the quality measured from the file. Pinned to Task 6 (probe) and Task 11 (pipeline, test `rejects_a_claimed_24_96_that_is_really_16_44_1_and_tries_the_next_candidate`).
+2. **The same ISRC arriving from two different albums** (compilation vs. studio album). Expected: deduplication is global, the loser is marked `duplicate_of`, its file stays on disk untouched, and no album ends up with a hole in its tracklist. Pinned to Task 12 (dedup, test `same_isrc_marks_the_new_file_as_duplicate`).
+3. **One source is unreachable or unauthorized while the others work.** Expected: the run continues, the failing source is reported as skipped with a reason, and the remaining sources still deliver the track. Pinned to Task 11 (pipeline, test `a_failing_source_does_not_break_the_run`).
+4. **Only lossy exists anywhere** for a track. Expected: the lossy file is kept as-is, never re-encoded, and carries the honest "источник lossy" marker in the tag comment, the database and the TUI badge. Pinned to Task 7 (tags, test `lossy_files_get_the_honest_marker`) and Task 1 (ranking).
+5. **A Bandcamp album ZIP that contains 12 tracks but only 3 are wanted/downloaded.** Expected: the archive is unpacked, each track becomes its own candidate, the missing 9 are simply absent from the result, and the run is reported per track rather than failing the whole album. Pinned to Task 11 (pipeline, test `a_three_of_twelve_release_is_a_partial_success_and_is_reported`).
 
 ---
 
@@ -52,12 +52,12 @@ The spec is a vision document; these inputs are implied by it but not covered by
 **Interfaces:**
 - Consumes: nothing (first task).
 - Produces:
-  - `maxfetch::model::SourceId` — `enum { Soulseek, Bandcamp, Youtube, Spotify, SoundCloud, Qobuz, Tidal, Deezer, Beatport }`, `Copy + Eq + Hash + Serialize + Deserialize`, with `SourceId::as_str(&self) -> &'static str` and `SourceId::from_str(&str) -> Option<SourceId>` (accepts the lowercase forms used in config and in the CLI).
-  - `maxfetch::model::Container` — `enum { Flac, Wav, Aiff, Alac, M4aAac, Mp3, Opus, Webm }`, with `Container::as_str(&self) -> &'static str`, `Container::from_ext(&str) -> Option<Container>` (lowercase, `"m4a"` and `"mp4"` both map to `M4aAac`), `Container::is_lossless(&self) -> bool` (true for `Flac`, `Wav`, `Aiff`, `Alac`).
+  - `maxfetch::model::SourceId` — `enum { Soulseek, Bandcamp, Youtube, Spotify, SoundCloud, Qobuz, Tidal, Deezer, Beatport }`, `Copy + Clone + Debug + PartialEq + Eq + Hash + Serialize + Deserialize`, with `SourceId::as_str(&self) -> &'static str` and `SourceId::from_str(&str) -> Option<SourceId>` (accepts the lowercase forms used in config and in the CLI).
+  - `maxfetch::model::Container` — `enum { Flac, Wav, Aiff, Alac, M4aAac, Mp3, Opus, Webm }`, `Clone + Copy + Debug + PartialEq + Eq + Serialize + Deserialize`, with `Container::as_str(&self) -> &'static str`, `Container::from_ext(&str) -> Option<Container>` (lowercase, `"m4a"` and `"mp4"` both map to `M4aAac`), `Container::is_lossless(&self) -> bool` (true for `Flac`, `Wav`, `Aiff`, `Alac`).
   - `maxfetch::model::Quality` — `struct { lossless: bool, container: Container, bit_depth: Option<u8>, sample_rate: Option<u32>, bitrate_kbps: Option<u32> }`, `Clone + Debug + PartialEq + Serialize + Deserialize + Default`.
-  - `maxfetch::model::Release` — `struct { title: String, artist: String, album: Option<String>, track_no: Option<u32>, duration_sec: Option<f64>, isrc: Option<String>, year: Option<i32>, source: SourceId, source_item_id: String }`.
-  - `maxfetch::model::Locator` — `enum { Soulseek { username: String, filename: String, size: u64 }, Bandcamp { url: String, encoding: String }, Youtube { url: String, video_id: String }, Spotify { track_id: String }, SoundCloud { track_id: String }, Qobuz { track_id: String, format_id: u32 }, Tidal { track_id: String, quality: u8 }, Deezer { track_id: String }, Beatport { track_id: String } }`.
-  - `maxfetch::model::Candidate` — `struct { source: SourceId, release: Release, quality: Quality, size_bytes: Option<u64>, locator: Locator }`.
+  - `maxfetch::model::Release` — `struct { title: String, artist: String, album: Option<String>, track_no: Option<u32>, duration_sec: Option<f64>, isrc: Option<String>, year: Option<i32>, source: SourceId, source_item_id: String }`, `Clone + Debug + PartialEq + Serialize + Deserialize`.
+  - `maxfetch::model::Locator` — `enum { Soulseek { username: String, filename: String, size: u64 }, Bandcamp { url: String, encoding: String }, Youtube { url: String, video_id: String }, Spotify { track_id: String }, SoundCloud { track_id: String }, Qobuz { track_id: String, format_id: u32 }, Tidal { track_id: String, quality: u8 }, Deezer { track_id: String }, Beatport { track_id: String } }`, `Clone + Debug + PartialEq + Serialize + Deserialize`.
+  - `maxfetch::model::Candidate` — `struct { source: SourceId, release: Release, quality: Quality, size_bytes: Option<u64>, locator: Locator }`, `Clone + Debug + PartialEq`.
   - `maxfetch::quality::compare_quality(&Quality, &Quality) -> std::cmp::Ordering` — `Less` when the first is worse.
   - `maxfetch::quality::rank_candidates(&[Candidate]) -> Vec<Candidate>` — returns a new sorted vector, best first, with lossy candidates removed whenever at least one lossless candidate is present.
 
@@ -171,7 +171,7 @@ Expected: FAIL with "unresolved import `maxfetch::model`".
 
 - [ ] **Step 4: Implement `src/model.rs`**
 
-Create `src/model.rs` with the types listed in the Interfaces block. `SourceId::as_str` returns `"soulseek"`, `"bandcamp"`, `"youtube"`, `"spotify"`, `"soundcloud"`, `"qobuz"`, `"tidal"`, `"deezer"`, `"beatport"`; `from_str` parses exactly those strings. `Container::as_str` returns `"flac"`, `"wav"`, `"aiff"`, `"alac"`, `"m4a"`, `"mp3"`, `"opus"`, `"webm"`. `Quality::default` is `lossless: false, container: Container::Opus` with all three numeric fields `None`.
+Create `src/model.rs` with the types listed in the Interfaces block. Every listed type derives the traits named in the Interfaces block; `SourceId`, `Container`, `Release`, `Locator` and `Candidate` derive `Clone` and `Debug`, and `Release`, `Locator`, `Candidate` and `Quality` derive `PartialEq` because the tests compare them with `assert_eq!` and the pipeline clones them. `SourceId::as_str` returns `"soulseek"`, `"bandcamp"`, `"youtube"`, `"spotify"`, `"soundcloud"`, `"qobuz"`, `"tidal"`, `"deezer"`, `"beatport"`; `from_str` parses exactly those strings. `Container::as_str` returns `"flac"`, `"wav"`, `"aiff"`, `"alac"`, `"m4a"`, `"mp3"`, `"opus"`, `"webm"`. `Quality::default` is `lossless: false, container: Container::Opus` with all three numeric fields `None`.
 
 - [ ] **Step 5: Implement `src/quality.rs`**
 
@@ -391,7 +391,7 @@ git commit -m "feat(core): name normalization and release grouping"
   - `maxfetch::config::Config` — `struct { library: LibraryConfig, sources: SourcesConfig, matching: MatchingConfig, download: DownloadConfig, youtube: YoutubeConfig, media: MediaConfig }`, `Serialize + Deserialize + Clone + Debug`, with `Config::default()`.
   - `LibraryConfig { path: PathBuf }` — default `~/Music/maxfetch`.
   - `SourcesConfig { enabled: Vec<String> }` — default `["soulseek", "bandcamp", "youtube", "spotify"]`.
-  - `MatchingConfig { duration_tolerance_sec: f64, require_isrc: bool }` — defaults `2.0`, `false`.
+  - `MatchingConfig { duration_tolerance_sec: u32, require_isrc: bool }` — `Clone + Debug + PartialEq + Serialize + Deserialize + Default`; defaults `2`, `false`. `duration_tolerance_sec` is the configurable matching tolerance required by spec §7.6 and is the only source of that tolerance: `dedup::register` (Task 12) reads it from `Config::matching` instead of hard-coding 2 seconds, casting to `f64` where the matcher expects seconds as a float.
   - `DownloadConfig { max_concurrency: usize, retry_attempts: u32, timeout_sec: u64, stall_timeout_sec: u64 }` — defaults `4`, `3`, `60`, `30`.
   - `YoutubeConfig { yt_dlp_path: String }` — default `"yt-dlp"`.
   - `MediaConfig { ffmpeg_path: String }` — default `"ffmpeg"`.
@@ -407,13 +407,14 @@ Create `tests/config.rs`:
 ```rust
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use maxfetch::config::{Config, Credentials};
 
 #[test]
 fn defaults_are_usable_when_no_file_exists() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = Config::load_from(dir.path()).unwrap();
-    assert_eq!(cfg.matching.duration_tolerance_sec, 2.0);
+    assert_eq!(cfg.matching.duration_tolerance_sec, 2);
     assert!(cfg.sources.enabled.contains(&"soulseek".to_string()));
 }
 
@@ -425,7 +426,7 @@ fn config_round_trips_through_disk() {
     cfg.sources.enabled = vec!["soulseek".into()];
     cfg.save_to(dir.path()).unwrap();
 
-    let raw = fs::read_to_string(dir.path().join("maxfetch").join("config.toml")).unwrap();
+    let raw = fs::read_to_string(dir.path().join("config.toml")).unwrap();
     assert!(raw.contains("[library]"));
 
     let again = Config::load_from(dir.path()).unwrap();
@@ -439,7 +440,7 @@ fn credentials_are_written_with_mode_0600() {
     let mut creds = Credentials::default();
     creds.soulseek = Some(Default::default());
     creds.save_to(dir.path()).unwrap();
-    let path = dir.path().join("maxfetch").join("credentials.toml");
+    let path = dir.path().join("credentials.toml");
     let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
 }
@@ -457,12 +458,31 @@ fn wide_permissions_are_tightened() {
     let dir = tempfile::tempdir().unwrap();
     let creds = Credentials::default();
     creds.save_to(dir.path()).unwrap();
-    let path = dir.path().join("maxfetch").join("credentials.toml");
+    let path = dir.path().join("credentials.toml");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
     let changed = maxfetch::config::ensure_private(&path).unwrap();
     assert!(changed);
     let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
+}
+
+#[test]
+fn matching_duration_tolerance_can_be_overridden() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::load_from(dir.path()).unwrap();
+    assert_eq!(cfg.matching.duration_tolerance_sec, 2.0);
+    assert!(!cfg.matching.require_isrc);
+
+    cfg.matching.duration_tolerance_sec = 5;
+    cfg.matching.require_isrc = true;
+    cfg.save_to(dir.path()).unwrap();
+
+    let raw = fs::read_to_string(dir.path().join("config.toml")).unwrap();
+    assert!(raw.contains("[matching]"));
+
+    let again = Config::load_from(dir.path()).unwrap();
+    assert_eq!(again.matching.duration_tolerance_sec, 5.0);
+    assert!(again.matching.require_isrc);
 }
 ```
 
@@ -480,7 +500,7 @@ Use `toml` for both files. `config_dir()` returns `$XDG_CONFIG_HOME/maxfetch` wh
 Add `pub mod config;` to `src/lib.rs`.
 
 Run: `cargo test --test config`
-Expected: PASS, 5 tests.
+Expected: PASS, 6 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -498,12 +518,12 @@ git commit -m "feat(core): config, credentials and XDG paths"
 - Test: `tests/db.rs`
 
 **Interfaces:**
-- Consumes: `maxfetch::model::{Container, SourceId}` (Task 1).
+- Consumes: `maxfetch::model::{Container, Release, SourceId}` (Task 1).
 - Produces:
   - `maxfetch::db::Db` — wraps a `rusqlite::Connection`.
   - `Db::open(path: &Path) -> anyhow::Result<Db>` (opens the file, creates parent directories, sets `PRAGMA journal_mode=WAL`, `PRAGMA foreign_keys=ON`, runs migrations).
   - `Db::open_in_memory() -> anyhow::Result<Db>`.
-  - `Db::migrate(&self) -> anyhow::Result<()>` — creates `schema_version`, `tracks`, `releases`, `downloads`, `settings` exactly as in spec section 7.9, plus the three indexes `idx_tracks_isrc`, `idx_tracks_matchkey`, `idx_tracks_dup`.
+  - `Db::migrate(&self) -> anyhow::Result<()>` — creates `schema_version`, `tracks`, `releases`, `downloads`, `settings` exactly as in spec section 7.9, plus the three indexes `idx_tracks_isrc`, `idx_tracks_matchkey`, `idx_tracks_dup`. The `releases` table in this plan is keyed by `match_key` (not by `source_id + ':' + source_item_id`) and carries an extra `expires_at TEXT NOT NULL` column so the 7-day metadata cache of spec section 11 is representable: `key TEXT PRIMARY KEY, match_key TEXT NOT NULL, source_id TEXT NOT NULL, payload TEXT NOT NULL, fetched_at TEXT NOT NULL, expires_at TEXT NOT NULL`. The migration creates that shape, and it also runs as an in-place upgrade (`CREATE TABLE IF NOT EXISTS` plus `ALTER TABLE releases ADD COLUMN expires_at TEXT NOT NULL DEFAULT ''` when the column is missing) so an existing state.db gains `expires_at` without being dropped.
   - `maxfetch::db::TrackRecord` — `struct { id: i64, isrc: Option<String>, match_key: String, title: String, artist: String, album: Option<String>, track_no: Option<u32>, duration_sec: Option<f64>, lossless: bool, container: Container, bit_depth: Option<u8>, sample_rate: Option<u32>, bitrate_kbps: Option<u32>, size_bytes: Option<u64>, path: String, source: SourceId, acquired_at: String, duplicate_of: Option<i64> }`.
   - `Db::insert_track(&self, record: &TrackRecord) -> anyhow::Result<i64>` — inserts, returns the new row id, fails on a duplicate `path`.
   - `Db::find_by_isrc(&self, isrc: &str) -> anyhow::Result<Vec<TrackRecord>>`.
@@ -514,13 +534,15 @@ git commit -m "feat(core): config, credentials and XDG paths"
   - `maxfetch::db::DuplicateGroup` — `struct { winner: TrackRecord, losers: Vec<TrackRecord>, conflict: bool }`; `conflict` is true when the loser's quality is indistinguishable from the winner's (same lossless flag, same bit depth, same sample rate, same bitrate).
   - `Db::delete_track(&self, id: i64) -> anyhow::Result<()>` — deletes the row only, never touches the file.
   - `Db::log_download(&self, source: SourceId, track_id: Option<i64>, state: &str, reason: Option<&str>) -> anyhow::Result<()>`.
+  - `Db::upsert_release(&self, release: &Release) -> anyhow::Result<()>` — writes the release into the `releases` cache under `key = match_key(release)` (`maxfetch::match::match_key`), storing `source_id` and the JSON `payload`, refreshing `fetched_at` to now and `expires_at` to now + 7 days; a repeated write for the same key replaces the row (`INSERT ... ON CONFLICT(key) DO UPDATE`).
+  - `Db::get_release(&self, key: &str) -> anyhow::Result<Option<Release>>` — reads the row by `key` (the `match_key`) and returns `None` when the row is absent; the caller decides whether the entry is still fresh by comparing `expires_at` with the current time. Also expose `Db::release_is_fresh(&self, key: &str) -> anyhow::Result<bool>` (`true` only when a row exists and `expires_at` is later than now) so the pipeline does not have to re-implement the 7-day check.
 
 - [ ] **Step 1: Write the failing test**
 
 Create `tests/db.rs`:
 ```rust
 use maxfetch::db::{Db, TrackRecord};
-use maxfetch::model::{Container, SourceId};
+use maxfetch::model::{Container, Release, SourceId};
 
 fn record(path: &str, isrc: Option<&str>, key: &str) -> TrackRecord {
     TrackRecord {
@@ -583,6 +605,34 @@ fn delete_track_removes_only_the_row() {
     db.delete_track(a).unwrap();
     assert!(db.all_tracks().unwrap().is_empty());
 }
+
+#[test]
+fn release_cache_round_trips_and_expires() {
+    let db = Db::open_in_memory().unwrap();
+    let release = Release {
+        title: "Get Lucky".into(),
+        artist: "Daft Punk".into(),
+        album: Some("RAM".into()),
+        track_no: Some(8),
+        duration_sec: Some(369.0),
+        isrc: Some("FR1".into()),
+        year: Some(2013),
+        source: SourceId::Soulseek,
+        source_item_id: "r1".into(),
+    };
+    let key = maxfetch::match::match_key(&release);
+    assert!(db.get_release(&key).unwrap().is_none());
+    assert!(!db.release_is_fresh(&key).unwrap());
+
+    db.upsert_release(&release).unwrap();
+    let back = db.get_release(&key).unwrap().expect("cached release");
+    assert_eq!(back.title, "Get Lucky");
+    assert_eq!(back.source, SourceId::Soulseek);
+    assert!(db.release_is_fresh(&key).unwrap());
+
+    db.upsert_release(&release).unwrap();
+    assert_eq!(db.get_release(&key).unwrap().unwrap().source_item_id, "r1");
+}
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -592,14 +642,14 @@ Expected: FAIL with "unresolved import `maxfetch::db`".
 
 - [ ] **Step 3: Implement `src/db.rs`**
 
-Use `rusqlite` 0.41 with the `params![]` macro from `rusqlite::params`. Open with `Connection::open(path)`, create the parent directories first, then set `PRAGMA foreign_keys=ON` with `conn.pragma_update(None, "foreign_keys", true)` and WAL with `conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))`. The WAL pragma is the one exception to `pragma_update`: `PRAGMA journal_mode=WAL` returns a row, and `pragma_update` runs the statement through `execute`, which fails with "Execute returned results" — so `query_row` is required here, and the returned mode string is ignored. Store `source` as the `SourceId::as_str()` string and `container` as `Container::as_str()`; convert back on read. Store `acquired_at` as an RFC 3339 UTC timestamp produced by `chrono::Utc::now().to_rfc3339()`. `duplicate_groups` selects every track with a non-null `duplicate_of`, loads the winners, and groups them by winner id; the `conflict` flag is computed as described in the Interfaces block.
+Use `rusqlite` 0.41 with the `params![]` macro from `rusqlite::params`. Open with `Connection::open(path)`, create the parent directories first, then set `PRAGMA foreign_keys=ON` with `conn.pragma_update(None, "foreign_keys", true)` and WAL with `conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get::<_, String>(0))`. The WAL pragma is the one exception to `pragma_update`: `PRAGMA journal_mode=WAL` returns a row, and `pragma_update` runs the statement through `execute`, which fails with "Execute returned results" — so `query_row` is required here, and the returned mode string is ignored. Store `source` as the `SourceId::as_str()` string and `container` as `Container::as_str()`; convert back on read. Store `acquired_at` as an RFC 3339 UTC timestamp produced by `chrono::Utc::now().to_rfc3339()`. `duplicate_groups` selects every track with a non-null `duplicate_of`, loads the winners, and groups them by winner id; the `conflict` flag is computed as described in the Interfaces block. `upsert_release` stores `serde_json::to_string(release)` in `payload` with `source_id` from `release.source.as_str()` and `key = match_key(release)`; `fetched_at` and `expires_at` are RFC 3339 UTC strings from `chrono::Utc::now()` and `chrono::Utc::now() + chrono::Duration::days(7)`. `get_release` parses `payload` back into `Release` and returns `None` for an unknown key. `release_is_fresh` compares the stored `expires_at` string against `Utc::now().to_rfc3339()` lexicographically, which is valid for RFC 3339 UTC timestamps.
 
 - [ ] **Step 4: Declare the module and run the test**
 
 Add `pub mod db;` to `src/lib.rs`.
 
 Run: `cargo test --test db`
-Expected: PASS, 4 tests.
+Expected: PASS, 5 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -857,6 +907,7 @@ fn writes_core_fields_and_isrc() {
         quality: Quality { lossless: true, container: Container::Flac, bit_depth: Some(16), sample_rate: Some(44100), bitrate_kbps: None },
         source: SourceId::Soulseek,
         acquired_at: "2026-11-10T00:00:00Z".into(),
+        quality_comment: String::new(),
     };
     write_tags(&path, &meta).unwrap();
     let back = read_tags(&path).unwrap();
@@ -881,6 +932,7 @@ fn lossy_files_get_the_honest_marker() {
         quality: Quality { lossless: false, container: Container::Opus, bit_depth: None, sample_rate: Some(48000), bitrate_kbps: Some(160) },
         source: SourceId::Youtube,
         acquired_at: "2026-11-10T00:00:00Z".into(),
+        quality_comment: String::new(),
     };
     write_tags(&path, &meta).unwrap();
     let comment = read_tags(&path).unwrap().quality_comment;
@@ -902,6 +954,7 @@ fn lossless_files_get_no_lossy_marker() {
         quality: Quality { lossless: true, container: Container::Flac, bit_depth: Some(16), sample_rate: Some(44100), bitrate_kbps: None },
         source: SourceId::Soulseek,
         acquired_at: "2026-11-10T00:00:00Z".into(),
+        quality_comment: String::new(),
     };
     write_tags(&path, &meta).unwrap();
     assert!(!read_tags(&path).unwrap().quality_comment.contains("source=lossy"));
@@ -967,11 +1020,15 @@ git commit -m "feat(core): tag writing and lossy marker"
 
 - [ ] **Step 1: Write the failing test**
 
-Create `tests/fetch.rs`:
+Create `tests/fetch.rs`. The test serves a fixed byte payload from a tiny local HTTP server built on `std::net::TcpListener` in a background thread — no new dependencies, and no `file://` URL anywhere:
 ```rust
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use maxfetch::fetch::{download_to_file, ProgressSink};
+
+const PAYLOAD: &[u8] = b"maxfetch test payload";
 
 struct Counter(AtomicU64);
 impl ProgressSink for Counter {
@@ -979,17 +1036,36 @@ impl ProgressSink for Counter {
     fn on_finished(&self, _transferred: u64) {}
 }
 
+/// Serves exactly one HTTP/1.1 request on a port picked by the OS and returns the base URL.
+fn serve_once(payload: &'static [u8]) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 1024];
+        let _ = stream.read(&mut buf);
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            payload.len()
+        );
+        stream.write_all(header.as_bytes()).unwrap();
+        stream.write_all(payload).unwrap();
+        stream.flush().unwrap();
+    });
+    format!("http://{addr}/file")
+}
+
 #[tokio::test]
 async fn downloads_a_file_and_renames_it() {
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("out.bin");
+    let url = serve_once(PAYLOAD);
     let sink = Arc::new(Counter(AtomicU64::new(0)));
-    download_to_file(&reqwest::Client::new(), "file:///etc/hostname", &dest, sink.as_ref()).await.unwrap();
-    assert!(dest.exists());
+    download_to_file(&reqwest::Client::new(), &url, &dest, sink.as_ref()).await.unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), PAYLOAD);
     assert!(!dir.path().join("out.part").exists());
 }
 ```
-If `reqwest` refuses the `file://` scheme, replace the body of the test with a tiny local HTTP server: spin up a `tokio::net::TcpListener` on port 0, write a fixed HTTP/1.1 response with `Content-Length`, and download from `http://127.0.0.1:<port>/file`.
 
 - [ ] **Step 2: Run the test to verify it fails**
 
@@ -1165,13 +1241,14 @@ git commit -m "feat(core): source trait, capabilities and registry"
 - Test: `tests/pipeline.rs`
 
 **Interfaces:**
-- Consumes: `maxfetch::sources::Source`, `maxfetch::model::{Candidate, Release}`, `maxfetch::match::group_releases`, `maxfetch::quality::rank_candidates`, `maxfetch::probe::probe`, `maxfetch::tags::write_tags`, `maxfetch::library::{absolute_path, relative_path}`, `maxfetch::db::Db` (Tasks 1-10).
+- Consumes: `maxfetch::sources::Source`, `maxfetch::model::{Candidate, Quality, Release}`, `maxfetch::match::{group_releases, match_key}`, `maxfetch::quality::{compare_quality, rank_candidates}`, `maxfetch::probe::probe`, `maxfetch::tags::write_tags`, `maxfetch::library::{absolute_path, relative_path}`, `maxfetch::db::Db`, `maxfetch::dedup::register`, `maxfetch::fetch::ProgressSink`, `maxfetch::sources::Query` (Tasks 1-10, 12).
 - Produces:
   - `maxfetch::pipeline::Pipeline` — `struct { config: Config, db: Db, sources: Vec<Box<dyn Source>> }` with `Pipeline::new(config, db, sources)`.
-  - `Pipeline::search(&self, q: &Query) -> anyhow::Result<Vec<ReleaseGroup>>` — queries every enabled source in parallel, skips a failing source with a logged reason, groups the surviving releases.
-  - `Pipeline::candidates(&self, group: &ReleaseGroup) -> anyhow::Result<Vec<Candidate>>` — asks each source for candidates of the group's primary release, ranks them.
-  - `Pipeline::download(&self, candidate: &Candidate, sink: &dyn ProgressSink) -> anyhow::Result<DownloadResult>` — downloads to a temporary file, probes it, rejects it when the measured quality is worse than the claimed quality and no lossless alternative was expected, tags it, moves it to the library path and records it in the database.
-  - `maxfetch::pipeline::DownloadResult` — `struct { path: PathBuf, quality: Quality, probe: ProbeResult, rejected: bool, reason: Option<String> }`.
+  - `Pipeline::search(&self, q: &Query) -> anyhow::Result<Vec<ReleaseGroup>>` — consults the release cache first: for a plain text query the cache key is `match_key` of the synthetic release `Release { artist: "", title: q.text, album: None, .. }`, i.e. `"|" + norm(q.text) + "|"`. When `Db::release_is_fresh(&key)` is true the cached release is returned as a single group and **no source is contacted**; otherwise every enabled source is queried in parallel, a failing source is skipped with a logged reason, the surviving releases are grouped, and the results are written back with `Db::upsert_release` — once per grouped release under its own `match_key`, and once more per query under the query key (the primary release of the first group with `artist` empty, `album` `None` and `title` = the query text, so that its `match_key` is the query key). An empty source set (as in the core build, where the registry is empty) is not an error: the cache or an empty group list is returned.
+  - `Pipeline::candidates(&self, group: &ReleaseGroup) -> anyhow::Result<Vec<Candidate>>` — asks each source for candidates of the group's primary release, ranks them; the returned vector is sorted best first and is the input of `download`.
+  - `Pipeline::download(&self, candidates: &[Candidate], sink: &dyn ProgressSink) -> anyhow::Result<DownloadResult>` — takes the ranked candidate list and tries them in order (best first). For each candidate it downloads into `<library>/.tmp/<uuid>.part` and probes the result; a download error or a measured quality strictly worse than the candidate's claimed quality rejects that candidate and the loop moves to the next one; the first candidate that passes is tagged, moved into the library, registered with `dedup::register` and recorded, and its `DownloadResult` is returned. When every candidate is rejected, the last rejection is returned with `rejected: true`. Never re-encodes.
+  - `Pipeline::download_one(&self, candidate: &Candidate, sink: &dyn ProgressSink) -> anyhow::Result<DownloadResult>` — the single-candidate convenience wrapper: calls the slice form with a one-element slice so both entry points share one code path.
+  - `maxfetch::pipeline::DownloadResult` — `struct { path: PathBuf, quality: Quality, probe: ProbeResult, rejected: bool, reason: Option<String>, attempts: usize }`. `rejected` is true when at least one candidate of this call was rejected (the file delivered less than the claim, or the download failed) and stays true even when a later candidate succeeded; `reason` holds the reason of the last rejection; `attempts` is the number of candidates tried; `path` is the accepted file and is empty when every candidate was rejected.
   - `maxfetch::pipeline::Pipeline::source_status(&self) -> Vec<SourceStatus>`.
   - `maxfetch::pipeline::Pipeline::db(&self) -> &Db`.
 
@@ -1194,6 +1271,10 @@ struct Fake {
     quality: Quality,
     bytes: Vec<u8>,
     fail_search: bool,
+}
+
+fn fixture(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe").join(name)
 }
 
 fn rel(source: SourceId) -> Release {
@@ -1238,13 +1319,19 @@ impl Source for Fake {
 Then the test bodies:
 
 ```rust
+fn cfg_in(dir: &std::path::Path) -> Config {
+    let mut cfg = Config::default();
+    cfg.library.path = dir.join("library");
+    cfg
+}
+
 #[tokio::test]
 async fn a_failing_source_does_not_break_the_run() {
-    let cfg = Config::default();
+    let dir = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
     let bad = Fake { id: SourceId::Beatport, releases: vec![], quality: Quality::default(), bytes: vec![], fail_search: true };
     let good = Fake { id: SourceId::Soulseek, releases: vec![rel(SourceId::Soulseek)], quality: Quality { lossless: true, container: Container::Flac, bit_depth: Some(16), sample_rate: Some(44100), bitrate_kbps: None }, bytes: std::fs::read(fixture("sine_44100_s16.flac")).unwrap(), fail_search: false };
-    let p = Pipeline::new(cfg, db, vec![Box::new(bad), Box::new(good)]);
+    let p = Pipeline::new(cfg_in(dir.path()), db, vec![Box::new(bad), Box::new(good)]);
     let groups = p.search(&Query { text: Some("daft punk get lucky".into()), url: None, items: vec![] }).await.unwrap();
     assert_eq!(groups.len(), 1);
     assert_eq!(groups[0].sources, vec![SourceId::Soulseek]);
@@ -1252,19 +1339,88 @@ async fn a_failing_source_does_not_break_the_run() {
 
 #[tokio::test]
 async fn download_probes_tags_and_records_the_track() {
-    let cfg = Config::default();
+    let dir = tempfile::tempdir().unwrap();
     let db = Db::open_in_memory().unwrap();
     let fake = Fake { id: SourceId::Soulseek, releases: vec![rel(SourceId::Soulseek)], quality: Quality { lossless: true, container: Container::Flac, bit_depth: Some(16), sample_rate: Some(44100), bitrate_kbps: None }, bytes: std::fs::read(fixture("sine_44100_s16.flac")).unwrap(), fail_search: false };
-    let p = Pipeline::new(cfg.clone(), db, vec![Box::new(fake)]);
+    let p = Pipeline::new(cfg_in(dir.path()), db, vec![Box::new(fake)]);
     let groups = p.search(&Query { text: Some("x".into()), url: None, items: vec![] }).await.unwrap();
     let cands = p.candidates(&groups[0]).await.unwrap();
-    let res = p.download(&cands[0], &maxfetch::fetch::NoopSink).await.unwrap();
+    let res = p.download(&cands, &maxfetch::fetch::NoopSink).await.unwrap();
     assert!(res.path.exists());
     assert!(!res.rejected);
+    assert_eq!(res.attempts, 1);
     assert_eq!(res.quality.bit_depth, Some(16));
     let tracks = p.db().all_tracks().unwrap();
     assert_eq!(tracks.len(), 1);
     assert!(tracks[0].path.ends_with(".flac"));
+}
+
+#[tokio::test]
+async fn rejects_a_claimed_24_96_that_is_really_16_44_1_and_tries_the_next_candidate() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let liar = Fake {
+        id: SourceId::Soulseek,
+        releases: vec![rel(SourceId::Soulseek)],
+        quality: Quality { lossless: true, container: Container::Flac, bit_depth: Some(24), sample_rate: Some(96000), bitrate_kbps: None },
+        bytes: std::fs::read(fixture("sine_44100_s16.flac")).unwrap(),
+        fail_search: false,
+    };
+    let honest = Fake {
+        id: SourceId::Qobuz,
+        releases: vec![rel(SourceId::Qobuz)],
+        quality: Quality { lossless: true, container: Container::Flac, bit_depth: Some(16), sample_rate: Some(44100), bitrate_kbps: None },
+        bytes: std::fs::read(fixture("sine_44100_s16.flac")).unwrap(),
+        fail_search: false,
+    };
+    let p = Pipeline::new(cfg_in(dir.path()), db, vec![Box::new(liar), Box::new(honest)]);
+    let groups = p.search(&Query { text: Some("daft punk get lucky".into()), url: None, items: vec![] }).await.unwrap();
+    let cands = p.candidates(&groups[0]).await.unwrap();
+    assert_eq!(cands.len(), 2, "both sources must be asked");
+    assert_eq!(cands[0].quality.bit_depth, Some(24), "the 24/96 claim ranks first");
+
+    let res = p.download(&cands, &maxfetch::fetch::NoopSink).await.unwrap();
+    assert!(res.rejected, "the 24/96 claim must not be trusted when the file is 16/44.1");
+    assert_eq!(res.attempts, 2, "the next candidate must have been tried");
+    assert!(res.reason.unwrap().contains("24"), "the reason must name the rejected claim");
+    let tracks = p.db().all_tracks().unwrap();
+    assert_eq!(tracks.len(), 1, "the honest candidate is recorded");
+    assert_eq!(tracks[0].bit_depth, Some(16), "the measured quality is recorded, not the claim");
+    assert_eq!(tracks[0].sample_rate, Some(44100));
+}
+
+#[tokio::test]
+async fn a_three_of_twelve_release_is_a_partial_success_and_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let wanted: Vec<Release> = (1..=12)
+        .map(|n| Release { source_item_id: format!("t{n}"), isrc: Some(format!("FR1234000{n:02}")), ..rel(SourceId::Bandcamp) })
+        .collect();
+    let fake = Fake {
+        id: SourceId::Bandcamp,
+        releases: wanted[..3].to_vec(),
+        quality: Quality { lossless: true, container: Container::Flac, bit_depth: Some(16), sample_rate: Some(44100), bitrate_kbps: None },
+        bytes: std::fs::read(fixture("sine_44100_s16.flac")).unwrap(),
+        fail_search: false,
+    };
+    let p = Pipeline::new(cfg_in(dir.path()), db, vec![Box::new(fake)]);
+    let groups = p.search(&Query { text: Some("album".into()), url: None, items: vec![] }).await.unwrap();
+    assert_eq!(groups.len(), 3, "three of the twelve wanted tracks are offered");
+
+    let mut acquired = 0usize;
+    let mut failed = 0usize;
+    for group in &groups {
+        match p.candidates(group).await {
+            Ok(cands) if !cands.is_empty() => {
+                let res = p.download(&cands, &maxfetch::fetch::NoopSink).await.unwrap();
+                if res.rejected { failed += 1 } else { acquired += 1 }
+            }
+            _ => failed += 1,
+        }
+    }
+    assert_eq!(acquired, 3);
+    assert_eq!(failed, 0);
+    assert_eq!(p.db().all_tracks().unwrap().len(), 3, "the run reports partial success instead of failing");
 }
 ```
 
@@ -1275,22 +1431,71 @@ Expected: FAIL with "unresolved import `maxfetch::pipeline`".
 
 - [ ] **Step 3: Implement `src/pipeline.rs`**
 
-`search` runs `tokio::join!`-style concurrency over the enabled sources: spawn each source's `search`/`resolve` into a `tokio::task`, join them all, and collect the results. A source that returns an error is logged with `tracing::warn!` and contributes nothing; it never aborts the run.
+`search` first checks the release cache and only then the network. It derives `key = match_key(&Release { artist: "", title: q.text, album: None, .. })` when the query is a plain text query and calls `Db::release_is_fresh(&key)`; a fresh hit (written less than 7 days ago) returns the cached release as a single group without contacting any source, so a repeated request in the same week does not re-query the sources. On a miss it runs `tokio::join!`-style concurrency over the enabled sources: spawn each source's `search`/`resolve` into a `tokio::task`, join them all, and collect the results. A source that returns an error is logged with `tracing::warn!` and contributes nothing; it never aborts the run. The surviving releases are grouped with `group_releases(..., config.matching.duration_tolerance_sec as f64)`; every grouped release is written back with `Db::upsert_release` under its own `match_key`, and the query key additionally gets the primary release of the first group (with `artist` empty and `album` `None`, so it hashes to the query key). `Db::upsert_release` refreshes `expires_at` to now + 7 days. With an empty source registry (the core build) `search` returns the cache hit or an empty vector; that is not an error.
 
-`download` performs, in order: download into `<library>/.tmp/<uuid>.part`; probe the file; compare the measured quality with the claimed quality using `maxfetch::quality::compare_quality` — if the measured quality is worse AND the candidate claimed lossless, the result is `rejected: true` with a reason, the temporary file is kept for inspection and the next candidate must be tried by the caller; otherwise write the tags, compute `absolute_path(&config.library.path, &candidate.release, ext)` with the extension taken from the measured container, create the parent directories, move the file there, insert a `TrackRecord` with the **measured** quality, and return `DownloadResult`.
+`download` takes the whole ranked list and applies the rejection rule from spec §7.5 literally: a candidate is dropped when the measured quality is worse than the claimed quality, or when its download fails, and the loop then tries the next candidate in descending quality order. Concretely, for each candidate in order: download into `<library>/.tmp/<uuid>.part`; probe the file; compare the measured quality with `candidate.quality` using `compare_quality(&measured, &claimed)` — `Less` means the file delivers less than the source promised, so the candidate is rejected with a reason naming the claim and the measurement, the temporary file is removed, `attempts` is incremented and the loop continues with the next candidate. A download error is handled the same way (rejected with the error text, next candidate). For the first candidate that passes: write the tags with the **measured** quality, compute `absolute_path(&config.library.path, &candidate.release, ext)` with the extension taken from the measured container, create the parent directories, move the file out of `.tmp` into the library, call `dedup::register(&self.config, &self.db, &candidate, &final_path, measured_quality.clone(), candidate.release.duration_sec)` (which marks a loser `duplicate_of` when the track is already known — the file stays on disk), write the `TrackRecord`/download log row using the id that `register` returned (`DedupOutcome::Inserted { id }` for a new track, `DedupOutcome::Duplicate { winner_id, loser_id }` for a known one), and return `DownloadResult { rejected: false, attempts, .. }`. When the list is exhausted every attempt failed: return the last rejection with `rejected: true`, an empty `path` and `attempts` equal to the number of candidates tried. Nothing is ever transcoded.
 
 - [ ] **Step 4: Declare the module and run the test**
 
 Add `pub mod pipeline;` to `src/lib.rs`.
 
 Run: `cargo test --test pipeline`
-Expected: PASS.
+Expected: PASS, 4 tests.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Add the release-cache test**
+
+Append to `tests/pipeline.rs` a source that counts how many times it was asked:
+
+```rust
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Arc;
+
+struct Counting { inner: Fake, searches: Arc<AtomicUsize> }
+
+#[async_trait]
+impl Source for Counting {
+    fn id(&self) -> SourceId { self.inner.id() }
+    fn capabilities(&self) -> Capabilities { self.inner.capabilities() }
+    fn auth_state(&self) -> AuthState { self.inner.auth_state() }
+    async fn search(&self, q: &Query) -> anyhow::Result<Vec<Release>> {
+        self.searches.fetch_add(1, AtomicOrdering::SeqCst);
+        self.inner.search(q).await
+    }
+    async fn resolve(&self, q: &Query) -> anyhow::Result<Vec<Release>> { self.inner.resolve(q).await }
+    async fn candidates(&self, r: &Release) -> anyhow::Result<Vec<Candidate>> { self.inner.candidates(r).await }
+    async fn download(&self, c: &Candidate, dest: &PathBuf, sink: &dyn maxfetch::fetch::ProgressSink) -> anyhow::Result<()> {
+        self.inner.download(c, dest, sink).await
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_search_within_seven_days_uses_the_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open_in_memory().unwrap();
+    let searches = Arc::new(AtomicUsize::new(0));
+    let fake = Counting {
+        inner: Fake { id: SourceId::Soulseek, releases: vec![rel(SourceId::Soulseek)], quality: Quality { lossless: true, container: Container::Flac, bit_depth: Some(16), sample_rate: Some(44100), bitrate_kbps: None }, bytes: std::fs::read(fixture("sine_44100_s16.flac")).unwrap(), fail_search: false },
+        searches: searches.clone(),
+    };
+    let p = Pipeline::new(cfg_in(dir.path()), db, vec![Box::new(fake)]);
+    let q = Query { text: Some("daft punk get lucky".into()), url: None, items: vec![] };
+
+    assert_eq!(p.search(&q).await.unwrap().len(), 1);
+    let after_first = searches.load(AtomicOrdering::SeqCst);
+    assert!(after_first >= 1, "the first search queries the source");
+    assert_eq!(p.search(&q).await.unwrap().len(), 1);
+    assert_eq!(searches.load(AtomicOrdering::SeqCst), after_first, "the second search must come from the cache");
+}
+```
+
+Run: `cargo test --test pipeline`
+Expected: PASS, 5 tests.
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add -A
-git commit -m "feat(core): fetch pipeline with probe, tagging and recording"
+git commit -m "feat(core): fetch pipeline with probe, tagging, dedup and release cache"
 ```
 
 ---
@@ -1302,10 +1507,10 @@ git commit -m "feat(core): fetch pipeline with probe, tagging and recording"
 - Test: `tests/dedup.rs`
 
 **Interfaces:**
-- Consumes: `maxfetch::db::{Db, TrackRecord}`, `maxfetch::model::{Candidate, Quality}`, `maxfetch::quality::compare_quality` (Tasks 1, 2, 4).
+- Consumes: `maxfetch::db::{Db, TrackRecord}`, `maxfetch::model::{Candidate, Quality}`, `maxfetch::quality::compare_quality`, `maxfetch::config::Config` (Tasks 1, 2, 3, 4).
 - Produces:
   - `maxfetch::dedup::DedupOutcome` — `enum { Inserted { id: i64 }, Duplicate { winner_id: i64, loser_id: i64 } }`.
-  - `maxfetch::dedup::register(db: &Db, candidate: &Candidate, path: &Path, probe_quality: Quality, duration_sec: Option<f64>) -> anyhow::Result<DedupOutcome>` — finds an existing track by ISRC, then by `match_key`, then by artist+title with a duration tolerance of 2 seconds; when a loser is found it is marked `duplicate_of` and the file is left untouched.
+  - `maxfetch::dedup::register(config: &Config, db: &Db, candidate: &Candidate, path: &Path, probe_quality: Quality, duration_sec: Option<f64>) -> anyhow::Result<DedupOutcome>` — finds an existing track by ISRC, then by `match_key`, then by artist+title using the duration tolerance from `config.matching.duration_tolerance_sec` (spec §7.6; no hard-coded 2 seconds); when a loser is found it is marked `duplicate_of` and the file is left untouched.
   - `maxfetch::dedup::scan_library(db: &Db, root: &Path) -> anyhow::Result<usize>` — indexes existing files found under `root` that are not yet known to the database; it never renames, moves or deletes anything; returns the number of newly indexed files.
   - `maxfetch::dedup::plan_deletion(db: &Db) -> anyhow::Result<Vec<DeletionPlan>>` — returns the exact list of files that `--apply --delete` would remove, excluding entries whose group is flagged `conflict`.
   - `maxfetch::dedup::DeletionPlan` — `struct { id: i64, path: String, winner_path: String, reason: String }`.
@@ -1315,6 +1520,7 @@ git commit -m "feat(core): fetch pipeline with probe, tagging and recording"
 
 Create `tests/dedup.rs`:
 ```rust
+use maxfetch::config::Config;
 use maxfetch::db::Db;
 use maxfetch::dedup::{apply_deletion, plan_deletion, register, scan_library};
 use maxfetch::model::{Candidate, Container, Locator, Quality, Release, SourceId};
@@ -1346,8 +1552,8 @@ fn quality(depth: u8) -> Quality {
 #[test]
 fn same_isrc_marks_the_new_file_as_duplicate() {
     let db = Db::open_in_memory().unwrap();
-    let first = register(&db, &candidate(Some("FR1"), "Get Lucky", "/m/a.flac"), std::path::Path::new("/m/a.flac"), quality(24), Some(369.0)).unwrap();
-    let second = register(&db, &candidate(Some("FR1"), "Get Lucky", "/m/b.flac"), std::path::Path::new("/m/b.flac"), quality(16), Some(369.0)).unwrap();
+    let first = register(&Config::default(), &db, &candidate(Some("FR1"), "Get Lucky", "/m/a.flac"), std::path::Path::new("/m/a.flac"), quality(24), Some(369.0)).unwrap();
+    let second = register(&Config::default(), &db, &candidate(Some("FR1"), "Get Lucky", "/m/b.flac"), std::path::Path::new("/m/b.flac"), quality(16), Some(369.0)).unwrap();
     assert!(matches!(first, maxfetch::dedup::DedupOutcome::Inserted { .. }));
     assert!(matches!(second, maxfetch::dedup::DedupOutcome::Duplicate { .. }));
     let groups = db.duplicate_groups().unwrap();
@@ -1357,8 +1563,8 @@ fn same_isrc_marks_the_new_file_as_duplicate() {
 #[test]
 fn the_better_quality_wins() {
     let db = Db::open_in_memory().unwrap();
-    register(&db, &candidate(Some("FR1"), "Get Lucky", "/m/low.flac"), std::path::Path::new("/m/low.flac"), quality(16), Some(369.0)).unwrap();
-    register(&db, &candidate(Some("FR1"), "Get Lucky", "/m/high.flac"), std::path::Path::new("/m/high.flac"), quality(24), Some(369.0)).unwrap();
+    register(&Config::default(), &db, &candidate(Some("FR1"), "Get Lucky", "/m/low.flac"), std::path::Path::new("/m/low.flac"), quality(16), Some(369.0)).unwrap();
+    register(&Config::default(), &db, &candidate(Some("FR1"), "Get Lucky", "/m/high.flac"), std::path::Path::new("/m/high.flac"), quality(24), Some(369.0)).unwrap();
     let groups = db.duplicate_groups().unwrap();
     let winner = &groups[0].winner;
     assert!(winner.path.ends_with("high.flac"));
@@ -1372,8 +1578,8 @@ fn dedup_never_deletes_files_by_itself() {
     std::fs::write(&a, b"a").unwrap();
     std::fs::write(&b, b"b").unwrap();
     let db = Db::open_in_memory().unwrap();
-    register(&db, &candidate(Some("FR1"), "Get Lucky", a.to_str().unwrap()), &a, quality(24), Some(369.0)).unwrap();
-    register(&db, &candidate(Some("FR1"), "Get Lucky", b.to_str().unwrap()), &b, quality(16), Some(369.0)).unwrap();
+    register(&Config::default(), &db, &candidate(Some("FR1"), "Get Lucky", a.to_str().unwrap()), &a, quality(24), Some(369.0)).unwrap();
+    register(&Config::default(), &db, &candidate(Some("FR1"), "Get Lucky", b.to_str().unwrap()), &b, quality(16), Some(369.0)).unwrap();
     assert!(a.exists() && b.exists());
 }
 
@@ -1385,20 +1591,54 @@ fn deletion_requires_an_explicit_plan_and_leaves_conflicts_alone() {
     std::fs::write(&a, b"a").unwrap();
     std::fs::write(&b, b"b").unwrap();
     let db = Db::open_in_memory().unwrap();
-    register(&db, &candidate(Some("FR1"), "Get Lucky", a.to_str().unwrap()), &a, quality(16), Some(369.0)).unwrap();
-    register(&db, &candidate(Some("FR1"), "Get Lucky", b.to_str().unwrap()), &b, quality(16), Some(369.0)).unwrap();
+    register(&Config::default(), &db, &candidate(Some("FR1"), "Get Lucky", a.to_str().unwrap()), &a, quality(16), Some(369.0)).unwrap();
+    register(&Config::default(), &db, &candidate(Some("FR1"), "Get Lucky", b.to_str().unwrap()), &b, quality(16), Some(369.0)).unwrap();
 
     let plans = plan_deletion(&db).unwrap();
     assert!(plans.is_empty(), "identical quality must be treated as a conflict");
 
     let c = dir.path().join("c.flac");
     std::fs::write(&c, b"c").unwrap();
-    register(&db, &candidate(Some("FR2"), "Other", c.to_str().unwrap()), &c, quality(16), Some(369.0)).unwrap();
-    register(&db, &candidate(Some("FR2"), "Other", dir.path().join("d.flac").to_str().unwrap()), &dir.path().join("d.flac"), quality(24), Some(369.0)).unwrap();
+    register(&Config::default(), &db, &candidate(Some("FR2"), "Other", c.to_str().unwrap()), &c, quality(16), Some(369.0)).unwrap();
+    register(&Config::default(), &db, &candidate(Some("FR2"), "Other", dir.path().join("d.flac").to_str().unwrap()), &dir.path().join("d.flac"), quality(24), Some(369.0)).unwrap();
     let plans = plan_deletion(&db).unwrap();
     assert_eq!(plans.len(), 1);
     let removed = apply_deletion(&db, &plans).unwrap();
     assert_eq!(removed, 1);
+}
+
+#[test]
+fn the_duration_tolerance_comes_from_the_config() {
+    // No ISRC and a different album, so the match_key lookup misses and the
+    // artist+title fallback with the configured duration decides.
+    let mut other = candidate(None, "Get Lucky", "/m/other.flac");
+    other.release.album = Some("Greatest Hits".into());
+
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.flac");
+    let b = dir.path().join("b.flac");
+    std::fs::write(&a, b"a").unwrap();
+    std::fs::write(&b, b"b").unwrap();
+
+    let db = Db::open_in_memory().unwrap();
+    let mut tight = Config::default();
+    tight.matching.duration_tolerance_sec = 2;
+    register(&tight, &db, &candidate(None, "Get Lucky", a.to_str().unwrap()), &a, quality(16), Some(369.0)).unwrap();
+    register(&tight, &db, &other, &b, quality(24), Some(374.0)).unwrap();
+    assert!(db.duplicate_groups().unwrap().is_empty(), "5 seconds apart is outside a 2 second tolerance");
+
+    let db = Db::open_in_memory().unwrap();
+    let c = dir.path().join("c.flac");
+    let d = dir.path().join("d.flac");
+    std::fs::write(&c, b"c").unwrap();
+    std::fs::write(&d, b"d").unwrap();
+    let mut loose = Config::default();
+    loose.matching.duration_tolerance_sec = 10;
+    register(&loose, &db, &candidate(None, "Get Lucky", c.to_str().unwrap()), &c, quality(16), Some(369.0)).unwrap();
+    let mut other2 = candidate(None, "Get Lucky", d.to_str().unwrap());
+    other2.release.album = Some("Greatest Hits".into());
+    register(&loose, &db, &other2, &d, quality(24), Some(374.0)).unwrap();
+    assert_eq!(db.duplicate_groups().unwrap().len(), 1, "10 seconds of tolerance groups them");
 }
 ```
 
@@ -1409,18 +1649,20 @@ Expected: FAIL with "unresolved import `maxfetch::dedup`".
 
 - [ ] **Step 3: Implement `src/dedup.rs`**
 
-`register` must run inside a single `BEGIN IMMEDIATE` transaction: look up by ISRC, then by `match_key`, then by artist+title within the duration tolerance; compare the found track's quality with the new one using `compare_quality`; the better one stays canonical and the other is marked `duplicate_of`. When the two qualities compare equal the group is a conflict and the loser is still marked, but `plan_deletion` must not list conflicts.
+`register` must run inside a single `BEGIN IMMEDIATE` transaction: look up by ISRC, then by `match_key`, then by artist+title within `config.matching.duration_tolerance_sec` (read from the `Config` argument, cast to `f64`; the constant 2 must not appear in `src/dedup.rs`); compare the found track's quality with the new one using `compare_quality`; the better one stays canonical and the other is marked `duplicate_of`. When the two qualities compare equal the group is a conflict and the loser is still marked, but `plan_deletion` must not list conflicts.
 
 `scan_library` walks `root` recursively, reads the tags of every audio file with `maxfetch::tags::read_tags`, and inserts a row for the files that are unknown to the database. It never renames, moves or deletes.
 
 `apply_deletion` deletes the file at `plan.path` and then the row with `plan.id`, and counts only the files that were actually removed.
+
+Callers outside the pipeline (the CLI and the library commands) pass `&Config::default()` or the loaded config; the tolerance only affects the artist+title fallback, so the default of 2 seconds keeps the existing tests green.
 
 - [ ] **Step 4: Declare the module and run the test**
 
 Add `pub mod dedup;` to `src/lib.rs`.
 
 Run: `cargo test --test dedup`
-Expected: PASS, 4 tests.
+Expected: PASS, 5 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1444,6 +1686,11 @@ git commit -m "feat(core): deduplication by isrc with explicit deletion"
   - `maxfetch::cli::Cli` — a `clap::Parser` struct with the subcommands `search`, `fetch`, `library`, `auth`, `sources`, `config`.
   - `maxfetch::cli::run(cli: Cli) -> anyhow::Result<()>` — the whole CLI behaviour, so it can be called from `main` and from tests.
   - `maxfetch::cli::run_with(cli: Cli, config: Config, credentials: Credentials, out: &mut dyn std::io::Write) -> anyhow::Result<()>` — the testable entry point.
+  - `maxfetch::cli::warn_if_credentials_too_open(credentials_path: &Path, out: &mut dyn std::io::Write) -> anyhow::Result<()>` — the startup guard required by spec §7.10: calls `maxfetch::config::ensure_private(credentials_path)` and, when it reports that the mode had to be tightened (or that the file was already readable by others), writes a single Russian line to `out` naming the path and the enforced mode `0600`. `ensure_private` is idempotent, so the guard is called with `maxfetch::config::credentials_path()` at the top of `run_with`, before any command runs, and never aborts the run. When the credentials file does not exist yet the guard returns `Ok(())` without output.
+  - `maxfetch::cli::ndjson_progress_line(event: &ExportEvent) -> String` — one JSON object per line, `{"event": ..., ...}`, for the `--ndjson-progress` stream; the stdout writer used by `--ndjson-progress` flushes after every line.
+  - `maxfetch::cli::read_input_csv(path: &Path) -> anyhow::Result<Vec<TrackInput>>` — reads a comma-separated CSV with the optional header `artist,title,album,isrc`, ignores an empty leading line, tolerates empty fields (an empty `album` or `isrc` becomes `None`), and errors when `artist` or `title` is empty on a data row.
+  - `maxfetch::cli::TrackInput` — `struct { artist: String, title: String, album: Option<String>, isrc: Option<String> }`.
+  - `maxfetch::cli::ExportEvent` — `struct { kind: String, detail: String }` — the minimal progress event shape that `ndjson_progress_line` serializes.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1486,6 +1733,61 @@ async fn library_list_json_is_valid() {
     let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
     assert!(v.is_array());
 }
+
+#[tokio::test]
+async fn ndjson_progress_writes_one_json_object_per_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = maxfetch::config::Config::load_from(dir.path()).unwrap();
+    cfg.library.path = dir.path().join("library");
+    let creds = maxfetch::config::Credentials::default();
+    let cli = Cli::parse_from(["maxfetch", "fetch", "--dry-run", "--ndjson-progress", "daft punk get lucky"]);
+    let mut out = Vec::new();
+    run_with(cli, cfg, creds, &mut out).await.unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.trim().is_empty(), "the progress stream must not be empty");
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(v.get("event").is_some(), "every line carries an event name");
+    }
+}
+
+#[tokio::test]
+async fn fetch_input_reads_a_csv_and_queues_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = maxfetch::config::Config::load_from(dir.path()).unwrap();
+    cfg.library.path = dir.path().join("library");
+    let csv = dir.path().join("input.csv");
+    std::fs::write(&csv, "artist,title,album,isrc\nDaft Punk,Get Lucky,Random Access Memories,FR123400001\nDaft Punk,One More Time,,\n").unwrap();
+
+    let rows = maxfetch::cli::read_input_csv(&csv).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].title, "Get Lucky");
+    assert_eq!(rows[0].isrc.as_deref(), Some("FR123400001"));
+    assert!(rows[1].album.is_none());
+    assert!(rows[1].isrc.is_none());
+
+    let creds = maxfetch::config::Credentials::default();
+    let cli = Cli::parse_from(["maxfetch", "fetch", "--dry-run", "--input", csv.to_str().unwrap()]);
+    let mut out = Vec::new();
+    run_with(cli, cfg, creds, &mut out).await.unwrap();
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("Get Lucky") && text.contains("One More Time"), "both rows must be planned");
+}
+
+#[test]
+fn wide_credentials_mode_prints_a_warning() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("credentials.toml");
+    std::fs::write(&path, "").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut out = Vec::new();
+    maxfetch::cli::warn_if_credentials_too_open(&path, &mut out).unwrap();
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("0600"), "the warning names the mode it enforces");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "the guard also tightens the file");
+}
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -1523,7 +1825,11 @@ pub enum Command {
 
 `LibraryCommand` has `Scan`, `Dedupe { #[arg(long)] apply: bool, #[arg(long)] delete: bool, #[arg(long)] yes: bool }` and `List`. `AuthCommand` has `Login { source: String }` and `Status`. `SourcesCommand` has `Check`. `ConfigCommand` has `Set { key: String, value: String }`.
 
-`run_with` resolves the config (`--library` overrides `config.library.path` and is written back), opens the database at `state_path()`, builds the pipeline from the registry, and dispatches. `library dedupe` prints the plan and deletes nothing unless `--apply --delete` are both present; `--yes` is additionally required in the non-interactive path, otherwise the command prompts. All user-facing strings are in Russian.
+`run_with` resolves the config (`--library` overrides `config.library.path` and is written back), opens the database at `state_path()`, builds the pipeline from the registry, and dispatches. `library scan` calls `dedup::scan_library(&db, &config.library.path)` and reports the number of indexed files. `library dedupe` prints the plan and deletes nothing unless `--apply --delete` are both present; `--yes` is additionally required in the non-interactive path, otherwise the command prompts. All user-facing strings are in Russian.
+
+`--ndjson-progress` is implemented as a real stream: `run_with` builds a `Box<dyn ProgressSink>` whose `on_progress`/`on_finished` produce one `ExportEvent` per event and write `ndjson_progress_line(&event)` plus `\n` to `out`, flushing after each line, so a consumer can read the stream incrementally. Without the flag the human-readable output is used and the sink is `NoopSink` in `--dry-run`. In `--dry-run` mode at least one `event` line is emitted per planned track (`"event": "plan"`), so the stream is never empty.
+
+`fetch --input <csv>` reads the file with `read_input_csv` and loads every row into the library queue: each `TrackInput` becomes a search/fetch target (artist + title, with `album` and `isrc` passed as matching hints), and the rows are processed in file order, one track at a time, so a bad row does not stop the others. With `--dry-run` the command only prints the planned rows; otherwise the normal fetch flow runs per row and the per-track results are summarized as добыто/пропущено.
 
 - [ ] **Step 4: Wire up `src/main.rs` and run the test**
 
@@ -1534,12 +1840,15 @@ use maxfetch::cli::{Cli, run};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    run(Cli::parse()).await
+    let cli = Cli::parse();
+    let mut stderr = std::io::stderr();
+    maxfetch::cli::warn_if_credentials_too_open(&maxfetch::config::credentials_path(), &mut stderr)?;
+    run(cli).await
 }
 ```
 
 Run: `cargo test --test cli`
-Expected: PASS, 3 tests.
+Expected: PASS, 6 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1558,11 +1867,12 @@ git commit -m "feat(core): headless cli"
 - Test: `tests/tui.rs`
 
 **Interfaces:**
-- Consumes: `maxfetch::pipeline::Pipeline`, `maxfetch::config::Config`, `maxfetch::model::SourceId` (Tasks 3, 11).
+- Consumes: `maxfetch::pipeline::Pipeline`, `maxfetch::config::Config`, `maxfetch::model::SourceId`, `ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState}` (Tasks 3, 11).
 - Produces:
-  - `maxfetch::tui::Screen` — `enum { Search, Results, Candidates, Downloads, Sources, Settings, Log }`.
-  - `maxfetch::tui::App` — `struct { screen: Screen, query: String, groups: Vec<ReleaseGroup>, selected: usize, candidates: Vec<Candidate>, downloads: Vec<DownloadItem>, log: Vec<LogEntry>, config: Config, status: Vec<SourceStatus>, should_quit: bool }`.
-  - `maxfetch::tui::App::new(config: Config) -> App`, `App::on_key(&mut self, key: KeyEvent) -> anyhow::Result<()>`, `App::set_library_path(&mut self, path: &str) -> anyhow::Result<()>`.
+  - `maxfetch::tui::Screen` — `enum { Search, Results, Candidates, Downloads, Sources, Settings, Log }`, `Clone + Copy + Debug + PartialEq`.
+  - `maxfetch::tui::ScrollState` — `struct { offset: usize, viewport: usize }` with `ScrollState::new() -> ScrollState` (offset 0), `ScrollState::reset(&mut self)`, `ScrollState::scroll_by(&mut self, delta: isize, len: usize)` (clamped to `0..=len.saturating_sub(1)`) and `ScrollState::position(&self) -> u16` (the `u16` value fed to `ScrollbarState::position`).
+  - `maxfetch::tui::App` — `struct { screen: Screen, query: String, groups: Vec<ReleaseGroup>, selected: usize, candidates: Vec<Candidate>, downloads: Vec<DownloadItem>, log: Vec<LogEntry>, config: Config, status: Vec<SourceStatus>, results_scroll: ScrollState, downloads_scroll: ScrollState, should_quit: bool }`. `results_scroll` covers the results and candidates lists, `downloads_scroll` covers the downloads list; both are reset to offset 0 when the screen changes, when a new search fills `groups`, and when the selection moves to a different list.
+  - `maxfetch::tui::App::new(config: Config) -> App`, `App::on_key(&mut self, key: KeyEvent) -> anyhow::Result<()>`, `App::set_library_path(&mut self, path: &str) -> anyhow::Result<()>`, `App::scroll_results(&mut self, delta: isize)` (clamps against `groups`/`candidates` length), `App::scroll_downloads(&mut self, delta: isize)` (clamps against `downloads` length).
   - `maxfetch::tui::render(frame: &mut ratatui::Frame, app: &App)` — draws the current screen.
   - `maxfetch::tui::run(config: Config) -> anyhow::Result<()>` — the event loop.
   - `maxfetch::tui::DownloadItem` — `struct { title: String, source: SourceId, state: String, transferred: u64, total: Option<u64>, speed: Option<u64>, detail: Option<String> }`.
@@ -1575,7 +1885,8 @@ Create `tests/tui.rs`:
 use std::path::PathBuf;
 use crossterm::event::KeyCode;
 use maxfetch::config::Config;
-use maxfetch::tui::{App, Screen};
+use maxfetch::model::SourceId;
+use maxfetch::tui::{App, DownloadItem, Screen, ScrollState};
 
 #[test]
 fn tab_switches_between_screens() {
@@ -1600,6 +1911,32 @@ fn settings_screen_can_change_the_library_path() {
     app.set_library_path("/tmp/newlib");
     assert_eq!(app.config.library.path, PathBuf::from("/tmp/newlib"));
 }
+
+#[test]
+fn scroll_state_tracks_and_clamps_the_offset() {
+    let mut scroll = ScrollState::new();
+    assert_eq!(scroll.position(), 0);
+    scroll.scroll_by(3, 10);
+    assert_eq!(scroll.position(), 3);
+    scroll.scroll_by(-10, 10);
+    assert_eq!(scroll.position(), 0);
+    scroll.scroll_by(100, 10);
+    assert_eq!(scroll.position(), 9);
+    scroll.reset();
+    assert_eq!(scroll.position(), 0);
+}
+
+#[test]
+fn changing_screens_resets_the_scroll() {
+    let mut app = App::new(Config::default());
+    app.screen = Screen::Downloads;
+    app.downloads.push(DownloadItem { title: "Get Lucky".into(), source: SourceId::Soulseek, state: "качается".into(), transferred: 10, total: Some(100), speed: Some(10), detail: None });
+    app.downloads.push(DownloadItem { title: "One More Time".into(), source: SourceId::Qobuz, state: "в очереди".into(), transferred: 0, total: None, speed: None, detail: None });
+    app.scroll_downloads(1);
+    assert_eq!(app.downloads_scroll.position(), 1, "the downloads list scrolls with the list length");
+    app.on_key(crossterm::event::KeyEvent::new(KeyCode::Tab, crossterm::event::KeyModifiers::NONE)).unwrap();
+    assert_eq!(app.downloads_scroll.position(), 0, "changing the screen resets the scroll");
+}
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -1619,12 +1956,14 @@ Key bindings, exactly as in spec section 7.11: `Tab`/`Shift+Tab` change the scre
 
 The Candidates screen shows, per candidate: the source badge, the measured-or-claimed quality (`24/48 FLAC`), the size, the `LOSSY` badge and the `conflict` badge. The Downloads screen shows a progress bar, the transfer speed, the ETA and the state of every item, and for Soulseek the peer name, its speed and its free slots. The Sources screen shows one line per source with its status (доступен / нет авторизации / ключ протух / недоступен по сети) and a «проверить» action bound to `c`. The Settings screen edits the library path, the per-source toggles, the limits and the `yt-dlp`/`ffmpeg` paths, and saves them to `config.toml` when leaving the screen.
 
+Scrolling (spec section 11 names scrollbars, so the state must exist): the results panel and the downloads panel each own a `ScrollState` and render a scrollbar on their right edge. In `render`, after drawing `List`/`Table` inside the panel's `Rect`, draw `ratatui::widgets::Scrollbar::new(ScrollbarOrientation::VerticalRight)` with `frame.render_stateful_widget(scrollbar, column_rect, &mut ScrollbarState::new(len).position(app.results_scroll.position() as usize))`; ratatui 0.30.2 exposes `Scrollbar`, `ScrollbarOrientation` and `ScrollbarState` from `ratatui::widgets`, and `ScrollbarState::new(content_len)` is the only constructor. The scrollbar is drawn only when `len > viewport_height` so short lists do not show a dead thumb. `Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End` adjust `results_scroll` on the Results and Candidates screens and `downloads_scroll` on the Downloads screen through `App::scroll_results`/`App::scroll_downloads`, which clamp to the list length. Both scroll states reset to offset 0 on every screen change (`Tab`/`Shift+Tab`), when a new search replaces `groups`, and when the selection moves to another list.
+
 - [ ] **Step 4: Declare the module and run the test**
 
 Add `pub mod tui;` to `src/lib.rs`.
 
 Run: `cargo test --test tui`
-Expected: PASS, 3 tests.
+Expected: PASS, 5 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1640,6 +1979,8 @@ git commit -m "feat(core): tui shell and screens"
 **Files:**
 - Create: `src/auth.rs`
 - Create: `README.md`
+- Create: `tests/e2e.rs` (behind `#![cfg(feature = "e2e")]`)
+- Modify: `Cargo.toml` (add a `[features]` section)
 - Test: `tests/auth.rs`
 
 **Interfaces:**
@@ -1703,12 +2044,136 @@ Add `pub mod auth;` to `src/lib.rs`.
 Run: `cargo test --test auth`
 Expected: PASS, 3 tests.
 
-- [ ] **Step 6: Run the whole suite**
+- [ ] **Step 6: Add the `e2e` feature and the end-to-end test**
+
+`Cargo.toml` gets a feature section; it is off by default, so the ordinary `cargo test` stays hermetic and fast:
+
+```toml
+[features]
+e2e = []
+```
+
+Create `tests/e2e.rs`, gated at the top with `#![cfg(feature = "e2e")]`, that drives the headless CLI over the real wiring (`Config` + `Credentials` + `cli::run_with` + `Pipeline`) in a temporary library, with a fake `Source` defined in the test file (the same four-method impl as `tests/pipeline.rs`'s `Fake`, copied in, serving the `sine_44100_s16.flac` fixture) and `state.db` redirected into the temporary directory:
+
+```rust
+#![cfg(feature = "e2e")]
+
+use clap::Parser;
+use std::path::PathBuf;
+
+use maxfetch::cli::{Cli, run_with};
+use maxfetch::config::{Config, Credentials, state_path};
+use maxfetch::db::Db;
+use maxfetch::fetch::NoopSink;
+use maxfetch::model::{Candidate, Container, Locator, Quality, Release, SourceId};
+use maxfetch::pipeline::Pipeline;
+use maxfetch::sources::{AuthState, Capabilities, Query, Source};
+use async_trait::async_trait;
+
+struct FakeSource { bytes: Vec<u8> }
+
+impl FakeSource {
+    fn new() -> Self {
+        let bytes = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe/sine_44100_s16.flac"),
+        ).unwrap();
+        Self { bytes }
+    }
+}
+
+fn rel() -> Release {
+    Release {
+        title: "Get Lucky".into(),
+        artist: "Daft Punk".into(),
+        album: Some("RAM".into()),
+        track_no: Some(8),
+        duration_sec: Some(369.0),
+        isrc: Some("FR123400001".into()),
+        year: Some(2013),
+        source: SourceId::Soulseek,
+        source_item_id: "r1".into(),
+    }
+}
+
+#[async_trait]
+impl Source for FakeSource {
+    fn id(&self) -> SourceId { SourceId::Soulseek }
+    fn capabilities(&self) -> Capabilities { Capabilities { audio: true, metadata_only: false, lossless: true, needs_auth: false } }
+    fn auth_state(&self) -> AuthState { AuthState::NotNeeded }
+    async fn search(&self, _q: &Query) -> anyhow::Result<Vec<Release>> { Ok(vec![rel()]) }
+    async fn resolve(&self, _q: &Query) -> anyhow::Result<Vec<Release>> { Ok(vec![rel()]) }
+    async fn candidates(&self, release: &Release) -> anyhow::Result<Vec<Candidate>> {
+        Ok(vec![Candidate {
+            source: SourceId::Soulseek,
+            release: release.clone(),
+            quality: Quality { lossless: true, container: Container::Flac, bit_depth: Some(16), sample_rate: Some(44100), bitrate_kbps: None },
+            size_bytes: Some(self.bytes.len() as u64),
+            locator: Locator::Soulseek { username: "peer".into(), filename: "f".into(), size: self.bytes.len() as u64 },
+        }])
+    }
+    async fn download(&self, _c: &Candidate, dest: &PathBuf, _sink: &dyn maxfetch::fetch::ProgressSink) -> anyhow::Result<()> {
+        std::fs::write(dest, &self.bytes)?;
+        Ok(())
+    }
+}
+
+#[test]
+fn search_fetch_scan_and_dedupe_dry_run() {
+    // One test in its own binary and no tokio runtime yet, so mutating the environment here is
+    // safe: state.db and the config both land under the temporary directory.
+    let dir = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("XDG_DATA_HOME", dir.path().join("data"));
+        std::env::set_var("XDG_CONFIG_HOME", dir.path().join("config"));
+    }
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut cfg = Config::default();
+        cfg.library.path = dir.path().join("library");
+
+        let db = Db::open(&state_path()).unwrap();
+        db.migrate().unwrap();
+        let pipeline = Pipeline::new(cfg.clone(), db, vec![Box::new(FakeSource::new())]);
+        let q = Query { text: Some("daft punk get lucky".into()), url: None, items: vec![] };
+        let groups = pipeline.search(&q).await.unwrap();
+        assert_eq!(groups.len(), 1);
+        let cands = pipeline.candidates(&groups[0]).await.unwrap();
+        assert_eq!(cands.len(), 1);
+        let res = pipeline.download(&cands, &NoopSink).await.unwrap();
+        assert!(!res.rejected);
+        assert!(res.path.starts_with(&cfg.library.path));
+        assert_eq!(pipeline.db().all_tracks().unwrap().len(), 1);
+        drop(pipeline);
+
+        let mut out = Vec::new();
+        let cli = Cli::parse_from(["maxfetch", "library", "scan"]);
+        run_with(cli, cfg.clone(), Credentials::default(), &mut out).await.unwrap();
+        assert!(String::from_utf8_lossy(&out).contains('1'), "the scanned file is reported");
+
+        let mut out = Vec::new();
+        let cli = Cli::parse_from(["maxfetch", "library", "dedupe"]);
+        run_with(cli, cfg.clone(), Credentials::default(), &mut out).await.unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("нечего удалять") || text.is_empty(), "the dry run deletes nothing");
+
+        let mut out = Vec::new();
+        let cli = Cli::parse_from(["maxfetch", "library", "dedupe"]);
+        run_with(cli, cfg, Credentials::default(), &mut out).await.unwrap();
+        assert!(res.path.exists(), "the dry run deletes nothing");
+    });
+}
+```
+
+Run: `cargo test --features e2e --test e2e`
+Expected: PASS, 1 test.
+
+- [ ] **Step 7: Run the whole suite**
 
 Run: `cargo test`
-Expected: all tests pass.
+Expected: all tests pass (the `e2e` test does not compile in this run).
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add -A
