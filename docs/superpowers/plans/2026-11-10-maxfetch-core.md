@@ -470,7 +470,7 @@ fn wide_permissions_are_tightened() {
 fn matching_duration_tolerance_can_be_overridden() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::load_from(dir.path()).unwrap();
-    assert_eq!(cfg.matching.duration_tolerance_sec, 2.0);
+    assert_eq!(cfg.matching.duration_tolerance_sec, 2);
     assert!(!cfg.matching.require_isrc);
 
     cfg.matching.duration_tolerance_sec = 5;
@@ -481,7 +481,7 @@ fn matching_duration_tolerance_can_be_overridden() {
     assert!(raw.contains("[matching]"));
 
     let again = Config::load_from(dir.path()).unwrap();
-    assert_eq!(again.matching.duration_tolerance_sec, 5.0);
+    assert_eq!(again.matching.duration_tolerance_sec, 5);
     assert!(again.matching.require_isrc);
 }
 ```
@@ -1251,7 +1251,7 @@ git commit -m "feat(core): source trait, capabilities and registry"
   - `Pipeline::download(&self, candidates: &[Candidate], sink: &dyn ProgressSink) -> anyhow::Result<DownloadResult>` — takes the ranked candidate list and tries them in order (best first). For each candidate it downloads into `<library>/.tmp/<uuid>.part` and probes the result; a download error or a measured quality strictly worse than the candidate's claimed quality rejects that candidate and the loop moves to the next one; the first candidate that passes is tagged, moved into the library, registered with `dedup::register` and recorded, and its `DownloadResult` is returned. When every candidate is rejected, the last rejection is returned with `rejected: true`. Never re-encodes.
   - `Pipeline::download_one(&self, candidate: &Candidate, sink: &dyn ProgressSink) -> anyhow::Result<DownloadResult>` — the single-candidate convenience wrapper: calls the slice form with a one-element slice so both entry points share one code path.
   - `maxfetch::pipeline::DownloadResult` — `struct { path: PathBuf, quality: Quality, probe: ProbeResult, rejected: bool, reason: Option<String>, attempts: usize }`. `rejected` is true when at least one candidate of this call was rejected (the file delivered less than the claim, or the download failed) and stays true even when a later candidate succeeded; `reason` holds the reason of the last rejection; `attempts` is the number of candidates tried; `path` is the accepted file and is empty when every candidate was rejected.
-  - `maxfetch::pipeline::Pipeline::source_status(&self) -> Vec<SourceStatus>`.
+  - `maxfetch::pipeline::Pipeline::source_statuses(&self) -> Vec<SourceStatus>` — the canonical name of this method is `source_statuses` (plural), not `source_status`; the stage plans call exactly `source_statuses()`.
   - `maxfetch::pipeline::Pipeline::db(&self) -> &Db`.
 
 - [ ] **Step 1: Write the failing test**
@@ -1435,6 +1435,8 @@ Expected: FAIL with "unresolved import `maxfetch::pipeline`".
 
 `search` first checks the release cache and only then the network. It derives `key = match_key(&Release { artist: "", title: q.text, album: None, .. })` when the query is a plain text query and calls `Db::release_is_fresh(&key)`; a fresh hit (written less than 7 days ago) returns the cached release as a single group without contacting any source, so a repeated request in the same week does not re-query the sources. On a miss it runs `tokio::join!`-style concurrency over every source the pipeline holds whose id passes `sources::enabled_in(&ids, &config)` — `Pipeline::new` receives the full registry, so the filter is applied here, not in `registry`: spawn each enabled source's `search`/`resolve` into a `tokio::task`, join them all, and collect the results. A source that returns an error is logged with `tracing::warn!` and contributes nothing; it never aborts the run. The surviving releases are grouped with `group_releases(..., config.matching.duration_tolerance_sec as f64)`; every grouped release is written back with `Db::upsert_release` under its own `match_key`, and the query key additionally gets the primary release of the first group (with `artist` empty and `album` `None`, so it hashes to the query key). `Db::upsert_release` refreshes `expires_at` to now + 7 days. With an empty source registry (the core build) `search` returns the cache hit or an empty vector; that is not an error.
 
+`source_statuses(&self) -> Vec<SourceStatus>` (the method name is plural, `source_statuses`, exactly as the stage plans call it) returns one `SourceStatus` per source the pipeline holds, in registry order, built from the source's `id`, `capabilities()` and `auth_state()`; in the core build the registry is empty, so it returns an empty vector.
+
 `download` takes the whole ranked list and applies the rejection rule from spec §7.5 literally: a candidate is dropped when the measured quality is worse than the claimed quality, or when its download fails, and the loop then tries the next candidate in descending quality order. Concretely, for each candidate in order: download into `<library>/.tmp/<uuid>.part`; probe the file; compare the measured quality with `candidate.quality` using `compare_quality(&measured, &claimed)` — `Less` means the file delivers less than the source promised, so the candidate is rejected with a reason naming the claim and the measurement, the temporary file is removed, `attempts` is incremented and the loop continues with the next candidate. A download error is handled the same way (rejected with the error text, next candidate). For the first candidate that passes: write the tags with the **measured** quality, compute `absolute_path(&config.library.path, &candidate.release, ext)` with the extension taken from the measured container, create the parent directories, move the file out of `.tmp` into the library, call `dedup::register(&self.config, &self.db, &candidate, &final_path, measured_quality.clone(), candidate.release.duration_sec)` (which marks a loser `duplicate_of` when the track is already known — the file stays on disk), write the `TrackRecord`/download log row using the id that `register` returned (`DedupOutcome::Inserted { id }` for a new track, `DedupOutcome::Duplicate { winner_id, loser_id }` for a known one), and return `DownloadResult { rejected: false, attempts, .. }`. When the list is exhausted every attempt failed: return the last rejection with `rejected: true`, an empty `path` and `attempts` equal to the number of candidates tried. Nothing is ever transcoded.
 
 - [ ] **Step 4: Declare the module and run the test**
@@ -1442,7 +1444,7 @@ Expected: FAIL with "unresolved import `maxfetch::pipeline`".
 Add `pub mod pipeline;` to `src/lib.rs`.
 
 Run: `cargo test --test pipeline`
-Expected: PASS, 4 tests.
+Expected: PASS, 5 tests — `tests/pipeline.rs` holds five tests in total: the four of Step 1 plus the release-cache test of Step 5.
 
 - [ ] **Step 5: Add the release-cache test**
 
@@ -1683,7 +1685,7 @@ git commit -m "feat(core): deduplication by isrc with explicit deletion"
 - Test: `tests/cli.rs`
 
 **Interfaces:**
-- Consumes: `maxfetch::cli::Cli`, `maxfetch::pipeline::Pipeline`, `maxfetch::config::{Config, Credentials}`, `maxfetch::db::Db`, `maxfetch::dedup` (Tasks 3, 4, 11, 12).
+- Consumes: `maxfetch::cli::Cli`, `maxfetch::pipeline::Pipeline`, `maxfetch::pipeline::Pipeline::source_statuses`, `maxfetch::config::{Config, Credentials}`, `maxfetch::db::Db`, `maxfetch::dedup` (Tasks 3, 4, 11, 12).
 - Produces:
   - `maxfetch::cli::Cli` — a `clap::Parser` struct with the subcommands `search`, `fetch`, `library`, `auth`, `sources`, `config`.
   - `maxfetch::cli::run(cli: Cli) -> anyhow::Result<()>` — the whole CLI behaviour, so it can be called from `main` and from tests.
@@ -1827,7 +1829,7 @@ pub enum Command {
 
 `LibraryCommand` has `Scan`, `Dedupe { #[arg(long)] apply: bool, #[arg(long)] delete: bool, #[arg(long)] yes: bool }` and `List`. `AuthCommand` has `Login { source: String }` and `Status`. `SourcesCommand` has `Check`. `ConfigCommand` has `Set { key: String, value: String }`.
 
-`run_with` resolves the config (`--library` overrides `config.library.path` and is written back), opens the database at `state_path()`, builds the pipeline from the registry, and dispatches. `library scan` calls `dedup::scan_library(&db, &config.library.path)` and reports the number of indexed files. `library dedupe` prints the plan and deletes nothing unless `--apply --delete` are both present; `--yes` is additionally required in the non-interactive path, otherwise the command prompts. All user-facing strings are in Russian.
+`run_with` resolves the config (`--library` overrides `config.library.path` and is written back), opens the database at `state_path()`, builds the pipeline from the registry, and dispatches. `library scan` calls `dedup::scan_library(&db, &config.library.path)` and reports the number of indexed files. `sources check` prints one line per source taken from `pipeline.source_statuses()` (the plural method name from core Task 11). `library dedupe` prints the plan and deletes nothing unless `--apply --delete` are both present; `--yes` is additionally required in the non-interactive path, otherwise the command prompts. All user-facing strings are in Russian.
 
 `--ndjson-progress` is implemented as a real stream: `run_with` builds a `Box<dyn ProgressSink>` whose `on_progress`/`on_finished` produce one `ExportEvent` per event and write `ndjson_progress_line(&event)` plus `\n` to `out`, flushing after each line, so a consumer can read the stream incrementally. Without the flag the human-readable output is used and the sink is `NoopSink` in `--dry-run`. In `--dry-run` mode at least one `event` line is emitted per planned track (`"event": "plan"`), so the stream is never empty.
 
@@ -1869,7 +1871,7 @@ git commit -m "feat(core): headless cli"
 - Test: `tests/tui.rs`
 
 **Interfaces:**
-- Consumes: `maxfetch::pipeline::Pipeline`, `maxfetch::config::Config`, `maxfetch::model::SourceId`, `ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState}` (Tasks 3, 11).
+- Consumes: `maxfetch::pipeline::Pipeline`, `maxfetch::pipeline::Pipeline::source_statuses`, `maxfetch::config::Config`, `maxfetch::model::SourceId`, `ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState}` (Tasks 3, 11).
 - Produces:
   - `maxfetch::tui::Screen` — `enum { Search, Results, Candidates, Downloads, Sources, Settings, Log }`, `Clone + Copy + Debug + PartialEq`.
   - `maxfetch::tui::ScrollState` — `struct { offset: usize, viewport: usize }` with `ScrollState::new() -> ScrollState` (offset 0), `ScrollState::reset(&mut self)`, `ScrollState::scroll_by(&mut self, delta: isize, len: usize)` (clamped to `0..=len.saturating_sub(1)`) and `ScrollState::position(&self) -> u16` (the `u16` value fed to `ScrollbarState::position`).
@@ -1956,9 +1958,9 @@ Use `ratatui` 0.30 and `crossterm` 0.29 with the `event-stream` feature. `run` c
 
 Key bindings, exactly as in spec section 7.11: `Tab`/`Shift+Tab` change the screen, `/` focuses the search field, `Enter` expands the selected release into candidates, `Space` marks, `d` downloads the marked items, `a` downloads the best candidate of every marked release, `s` opens the settings, `?` shows the help overlay, `q` quits.
 
-The Candidates screen shows, per candidate: the source badge, the measured-or-claimed quality (`24/48 FLAC`), the size, the `LOSSY` badge and the `conflict` badge. The Downloads screen shows a progress bar, the transfer speed, the ETA and the state of every item, and for Soulseek the peer name, its speed and its free slots. The Sources screen shows one line per source with its status (доступен / нет авторизации / ключ протух / недоступен по сети) and a «проверить» action bound to `c`. The Settings screen edits the library path, the per-source toggles, the limits and the `yt-dlp`/`ffmpeg` paths, and saves them to `config.toml` when leaving the screen.
+The Candidates screen shows, per candidate: the source badge, the measured-or-claimed quality (`24/48 FLAC`), the size, the `LOSSY` badge and the `conflict` badge. The Sources screen fills `App.status` from `Pipeline::source_statuses()` (the plural method name from core Task 11), so every line of that screen comes from that one call. The Downloads screen shows a progress bar, the transfer speed, the ETA and the state of every item, and for Soulseek the peer name, its speed and its free slots. The Sources screen shows one line per source with its status (доступен / нет авторизации / ключ протух / недоступен по сети) and a «проверить» action bound to `c`. The Settings screen edits the library path, the per-source toggles, the limits and the `yt-dlp`/`ffmpeg` paths, and saves them to `config.toml` when leaving the screen.
 
-Scrolling (spec section 11 names scrollbars, so the state must exist): the results panel and the downloads panel each own a `ScrollState` and render a scrollbar on their right edge. In `render`, after drawing `List`/`Table` inside the panel's `Rect`, draw `ratatui::widgets::Scrollbar::new(ScrollbarOrientation::VerticalRight)` with `frame.render_stateful_widget(scrollbar, column_rect, &mut ScrollbarState::new(len).position(app.results_scroll.position() as usize))`; ratatui 0.30.2 exposes `Scrollbar`, `ScrollbarOrientation` and `ScrollbarState` from `ratatui::widgets`, and `ScrollbarState::new(content_len)` is the only constructor. The scrollbar is drawn only when `len > viewport_height` so short lists do not show a dead thumb. `Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End` adjust `results_scroll` on the Results and Candidates screens and `downloads_scroll` on the Downloads screen through `App::scroll_results`/`App::scroll_downloads`, which clamp to the list length. Both scroll states reset to offset 0 on every screen change (`Tab`/`Shift+Tab`), when a new search replaces `groups`, and when the selection moves to another list.
+Scrolling (spec section 11 «Что остаётся за строителем» names the scrollbars, so the state must exist): the results panel and the downloads panel each own a `ScrollState` and render a scrollbar on their right edge. In `render`, after drawing `List`/`Table` inside the panel's `Rect`, draw `ratatui::widgets::Scrollbar::new(ScrollbarOrientation::VerticalRight)` with `frame.render_stateful_widget(scrollbar, column_rect, &mut ScrollbarState::new(len).position(app.results_scroll.position() as usize))`; ratatui 0.30.2 exposes `Scrollbar`, `ScrollbarOrientation` and `ScrollbarState` from `ratatui::widgets`, and `ScrollbarState::new(content_len)` is the only constructor. The scrollbar is drawn only when `len > viewport_height` so short lists do not show a dead thumb. `Up`/`Down`/`PageUp`/`PageDown`/`Home`/`End` adjust `results_scroll` on the Results and Candidates screens and `downloads_scroll` on the Downloads screen through `App::scroll_results`/`App::scroll_downloads`, which clamp to the list length. Both scroll states reset to offset 0 on every screen change (`Tab`/`Shift+Tab`), when a new search replaces `groups`, and when the selection moves to another list.
 
 - [ ] **Step 4: Declare the module and run the test**
 
