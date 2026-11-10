@@ -407,7 +407,7 @@ git commit -m "feat(bandcamp): fuzzy search, discography and tralbum metadata"
     | key | container | lossless | bitrate_kbps |
     | --- | --- | --- | --- |
     | `flac` | `Container::Flac` | true | `None` |
-    | `alac` | `Container::M4aAac` | false | `None` |
+    | `alac` | `Container::Alac` | true | `None` |
     | `wav` | `Container::Wav` | true | `None` |
     | `vorbis` | `Container::Opus` | false | `None` |
     | `mp3-v0` | `Container::Mp3` | false | `None` |
@@ -415,7 +415,7 @@ git commit -m "feat(bandcamp): fuzzy search, discography and tralbum metadata"
     | `aac-hi` | `Container::M4aAac` | false | `None` |
     | `mp3-128` | `Container::Mp3` | false | `Some(128)` |
 
-    `alac` is the one deliberate asymmetry: Apple Lossless is really lossless, but the core has no separate container for it and `Container::M4aAac.is_lossless() == false`, so the quality reports `lossless: false` with the `M4aAac` container and carries no lossless claim; the delivered bytes are still written untouched, and the probe of the stored file (which sees the ALAC codec) is what the database records. Every other key leaves `bit_depth` and `sample_rate` as `None` because only the probe may fill measured values; `mp3-v0` is VBR and therefore carries `bitrate_kbps: None` rather than a guess. Keys outside the table give `None`.
+    `alac` maps to `Container::Alac` and is reported as `lossless: true`, exactly like the core's `Container::is_lossless()` rule; it carries no bitrate because ALAC is lossless. Every key leaves `bit_depth` and `sample_rate` as `None` because only the probe may fill measured values; `mp3-v0` is VBR and therefore carries `bitrate_kbps: None` rather than a guess. Keys outside the table give `None`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -516,8 +516,8 @@ fn every_free_download_format_has_a_fixed_container_and_bitrate() {
     assert_eq!(flac.container, Container::Flac);
 
     let alac = format_quality("alac").unwrap();
-    assert_eq!(alac.container, Container::M4aAac);
-    assert!(!alac.lossless);
+    assert!(alac.lossless);
+    assert_eq!(alac.container, Container::Alac);
     assert_eq!(alac.bitrate_kbps, None);
 
     let wav = format_quality("wav").unwrap();
@@ -584,7 +584,7 @@ var _statDL_result = {"result":"err","retry_url":"https://nightwave.bandcamp.com
 
 `statdownload_url` splits the URL at the first `?` into a path and an optional query, requires the path to end with `/download` or contain `/download/`, replaces that segment with `/statdownload`, and appends the nonce with the separator that matches the original URL: `?` when the source URL had no query string (`{path}/statdownload?&.rand={nonce}`) and `&` when it had one (`{path}/statdownload?{query}&.rand={nonce}`). Writing `&` into a URL without a query would produce `.../statdownload&.rand=N`, which no client can parse, so the separator is derived from the source URL and never hardcoded. This is the exact shape Bandcamp answers: the 403 body is replaced by the `_statDL_result` object carrying a fresh `fsig`.
 
-`retry_encoding` parses the query string of the `retry_url` and returns the `enc` value, defaulting to `flac`. `format_quality` is the single place that maps a Bandcamp format key to a `Quality`; it fixes the container per the table in the Interfaces block and never fills `bit_depth`, `sample_rate` or an absent bitrate, because the probe is the only source of measured values. `alac` is the documented exception to the core's container set: the core has no ALAC container, so the key maps to `Container::M4aAac` and is reported as `lossless: false` — the stored bytes stay untouched and the probe of the real file decides what the database records. `mp3-128` is a real spec §8.2 key and is not "unknown": it is lossy MP3 at `Some(128)`.
+`retry_encoding` parses the query string of the `retry_url` and returns the `enc` value, defaulting to `flac`. `format_quality` is the single place that maps a Bandcamp format key to a `Quality`; it fixes the container per the table in the Interfaces block and never fills `bit_depth`, `sample_rate` or an absent bitrate, because the probe is the only source of measured values. `alac` maps to `Container::Alac` and is reported as `lossless: true`, matching the core's `Container::is_lossless()` rule. `mp3-128` is a real spec §8.2 key and is not "unknown": it is lossy MP3 at `Some(128)`.
 
 - [ ] **Step 5: Run the test to verify it passes**
 
