@@ -44,7 +44,7 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
         MetadataOptions::default(),
     )?;
 
-    let container = container_of(format.format_info().format);
+    let container = container_of(format.format_info().format)?;
     let audio = audio_track(format.as_ref())
         .ok_or_else(|| anyhow!("no audio track in {}", path.display()))?;
     let codec_params = audio.codec_params.as_ref().and_then(CodecParameters::audio);
@@ -78,15 +78,19 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
 
 /// Picks the default audio track, falling back to the first audio track available.
 fn audio_track(format: &dyn FormatReader) -> Option<&Track> {
-    format
-        .default_track(TrackType::Audio)
-        .or_else(|| format.tracks().iter().find(|t| t.codec_params.is_some()))
+    format.default_track(TrackType::Audio).or_else(|| {
+        format
+            .tracks()
+            .iter()
+            .find(|t| t.codec_params.as_ref().and_then(CodecParameters::audio).is_some())
+    })
 }
 
 /// Maps the probed container format to a [`Container`]. The probed format wins over the file
-/// extension, so a mislabelled file is reported as what it really is.
-fn container_of(format: FormatId) -> Container {
-    match format {
+/// extension, so a mislabelled file is reported as what it really is. Formats whose quality
+/// cannot be honestly described as one of our containers are rejected instead of guessed.
+fn container_of(format: FormatId) -> Result<Container> {
+    let container = match format {
         FORMAT_ID_FLAC => Container::Flac,
         FORMAT_ID_WAVE => Container::Wav,
         FORMAT_ID_AIFF => Container::Aiff,
@@ -94,8 +98,9 @@ fn container_of(format: FormatId) -> Container {
         FORMAT_ID_OGG => Container::Opus,
         FORMAT_ID_ISOMP4 => Container::M4aAac,
         FORMAT_ID_MKV => Container::Webm,
-        _ => Container::Opus,
-    }
+        other => anyhow::bail!("unsupported container format: {other}"),
+    };
+    Ok(container)
 }
 
 /// Converts the track duration in time base ticks to seconds. One tick is `numer/denom` seconds,
