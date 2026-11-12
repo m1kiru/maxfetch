@@ -5,6 +5,7 @@ pub mod library;
 pub mod matching;
 pub mod media;
 pub mod model;
+pub mod pipeline;
 pub mod probe;
 pub mod quality;
 pub mod sources;
