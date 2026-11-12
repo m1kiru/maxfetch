@@ -2,10 +2,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
-use rusqlite::{Connection, OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use crate::matching::match_key;
-use crate::model::{Container, Release, SourceId};
+use crate::model::{Container, Quality, Release, SourceId};
 
 /// A track row in the local library state.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,13 +30,52 @@ pub struct TrackRecord {
     pub duplicate_of: Option<i64>,
 }
 
+impl TrackRecord {
+    /// Качество записи в терминах модели [`Quality`].
+    ///
+    /// Используется для сравнения файлов при дедупликации: два файла считаются
+    /// неотличимыми, когда их [`Quality`] совпадает по `lossless`, `bit_depth`,
+    /// `sample_rate` и `bitrate_kbps` (контейнер в сравнении не участвует,
+    /// см. [`same_quality`]).
+    pub fn quality(&self) -> Quality {
+        Quality {
+            lossless: self.lossless,
+            container: self.container,
+            bit_depth: self.bit_depth,
+            sample_rate: self.sample_rate,
+            bitrate_kbps: self.bitrate_kbps,
+        }
+    }
+}
+
 /// A group of duplicate tracks: one canonical winner and the tracks that lost to it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DuplicateGroup {
     pub winner: TrackRecord,
     pub losers: Vec<TrackRecord>,
-    /// True when every loser's quality is indistinguishable from the winner's.
+    /// `true`, когда хотя бы один проигравший неотличим по качеству от
+    /// победителя (см. [`DuplicateGroup::indistinguishable_losers`]).
+    ///
+    /// Такой группе нельзя доверять автоматическое удаление: если два файла
+    /// звучат одинаково, выбор «победителя» произволен, а удаление неотличимой
+    /// копии необратимо. Поэтому `plan_deletion` (Task 12) обязан исключать
+    /// конфликтные группы из автоудаления и требовать ручного решения.
     pub conflict: bool,
+}
+
+impl DuplicateGroup {
+    /// Проигравшие, качество которых неотличимо от качества победителя.
+    ///
+    /// Неотличимость определяется теми же правилами, что и [`same_quality`]:
+    /// совпадают `lossless`, `bit_depth`, `sample_rate` и `bitrate_kbps`
+    /// (поле `container` не сравнивается). Возвращает пустой вектор, когда все
+    /// проигравшие строго хуже победителя, и `conflict` тогда равен `false`.
+    pub fn indistinguishable_losers(&self) -> Vec<&TrackRecord> {
+        self.losers
+            .iter()
+            .filter(|loser| same_quality(&self.winner, loser))
+            .collect()
+    }
 }
 
 /// SQLite-backed library state.
@@ -76,8 +115,35 @@ impl Db {
         Ok(db)
     }
 
-    fn prepare(&self) -> Result<()> {
-        self.conn
+    /// Прямой доступ к лежащему в основе [`Connection`].
+    ///
+    /// Нужен вызывающему коду, который строит свои запросы внутри транзакции:
+    /// [`Transaction`] реализует `Deref<Target = Connection>`, поэтому запросы
+    /// можно выполнять как на транзакции, так и на самом соединении. Не
+    /// используйте это для обхода инвариантов схемы.
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Начать транзакцию в режиме `BEGIN IMMEDIATE`.
+    ///
+    /// Единственный будущий писатель таблицы `tracks` — `dedup::register`
+    /// (Task 12), и его шаги обязаны быть атомарны: ISRC lookup, match_key
+    /// lookup, сравнение качеств, вставка и простановка `duplicate_of` должны
+    /// либо примениться целиком, либо не примениться вовсе. Иначе при
+    /// параллельном запуске два процесса могут одновременно решить, что оба
+    /// файла канонические, и `tracks` получит двух «победителей».
+    ///
+    /// `IMMEDIATE` берёт блокировку записи сразу при старте, а не при первом
+    /// `INSERT`: этого требует пункт 7.9 спеки (никакого «upgrade» блокировки
+    /// посреди чтения). Возвращённая транзакция откатывается при `drop`, если
+    /// её не закоммитить явно.
+    pub fn transaction(&self) -> Result<Transaction<'_>> {
+        Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)
+            .context("starting IMMEDIATE transaction")
+    }
+
+    fn prepare(&self) -> Result<()> {        self.conn
             .pragma_update(None, "foreign_keys", true)
             .context("enabling foreign_keys")?;
         // `PRAGMA journal_mode` returns a row, so it cannot go through `pragma_update`.
@@ -110,7 +176,7 @@ impl Db {
                path          TEXT NOT NULL UNIQUE,
                source_id     TEXT NOT NULL,
                acquired_at   TEXT NOT NULL,
-               duplicate_of  INTEGER REFERENCES tracks(id)
+               duplicate_of  INTEGER REFERENCES tracks(id) ON DELETE SET NULL
              );
              CREATE INDEX IF NOT EXISTS idx_tracks_isrc     ON tracks(isrc);
              CREATE INDEX IF NOT EXISTS idx_tracks_matchkey ON tracks(match_key);
@@ -125,7 +191,7 @@ impl Db {
              );
              CREATE TABLE IF NOT EXISTS downloads (
                id         INTEGER PRIMARY KEY,
-               track_id   INTEGER REFERENCES tracks(id),
+               track_id   INTEGER REFERENCES tracks(id) ON DELETE SET NULL,
                source_id  TEXT NOT NULL,
                state      TEXT NOT NULL,
                reason     TEXT,
@@ -273,10 +339,13 @@ impl Db {
             }
         }
         for group in &mut groups {
+            // Конфликт — когда ХОТЯ БЫ ОДИН проигравший неотличим по качеству
+            // от победителя: `plan_deletion` обязан исключать такую группу из
+            // автоудаления целиком (спека §7.6.5).
             group.conflict = group
                 .losers
                 .iter()
-                .all(|loser| same_quality(&group.winner, loser));
+                .any(|loser| same_quality(&group.winner, loser));
         }
         Ok(groups)
     }
@@ -293,7 +362,17 @@ impl Db {
     }
 
     /// Delete a track row. Never touches the file on disk.
+    ///
+    /// Входящие ссылки обнуляются явно, а не только через `ON DELETE SET NULL`
+    /// из DDL: `CREATE TABLE IF NOT EXISTS` не меняет уже существующую таблицу,
+    /// поэтому в базах, созданных до этой правки, каскада нет. Явный `UPDATE`
+    /// делает удаление безопасным для обоих случаев.
     pub fn delete_track(&self, id: i64) -> Result<()> {
+        // Проигравшие, ссылавшиеся на удаляемый трек, становятся каноническими
+        // вместо падения на нарушении внешнего ключа.
+        self.conn
+            .execute("UPDATE tracks SET duplicate_of = NULL WHERE duplicate_of = ?1", params![id])
+            .context("clearing duplicate_of references")?;
         self.conn
             .execute("DELETE FROM tracks WHERE id = ?1", params![id])
             .context("deleting track")?;
@@ -407,10 +486,12 @@ fn track_from_row(row: &Row<'_>) -> rusqlite::Result<TrackRecord> {
 }
 
 /// Two tracks have indistinguishable quality when lossless, bit depth, sample
-/// rate and bitrate all match.
+/// rate and bitrate all match. The container is deliberately not compared: a
+/// FLAC and a WAV of the same PCM stream are indistinguishable audio-wise.
 fn same_quality(a: &TrackRecord, b: &TrackRecord) -> bool {
-    a.lossless == b.lossless
-        && a.bit_depth == b.bit_depth
-        && a.sample_rate == b.sample_rate
-        && a.bitrate_kbps == b.bitrate_kbps
+    let (qa, qb) = (a.quality(), b.quality());
+    qa.lossless == qb.lossless
+        && qa.bit_depth == qb.bit_depth
+        && qa.sample_rate == qb.sample_rate
+        && qa.bitrate_kbps == qb.bitrate_kbps
 }
