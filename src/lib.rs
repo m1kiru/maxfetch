@@ -7,4 +7,5 @@ pub mod media;
 pub mod model;
 pub mod probe;
 pub mod quality;
+pub mod sources;
 pub mod tags;
