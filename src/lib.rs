@@ -5,3 +5,4 @@ pub mod matching;
 pub mod model;
 pub mod probe;
 pub mod quality;
+pub mod tags;
