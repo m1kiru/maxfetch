@@ -112,16 +112,46 @@ pub fn scan_library(db: &Db, root: &Path) -> Result<usize> {
     let mut pending: Vec<PathBuf> = vec![root.to_path_buf()];
 
     while let Some(dir) = pending.pop() {
-        let entries = std::fs::read_dir(&dir).with_context(|| {
-            if dir == root {
-                format!("scanning library root {}", dir.display())
-            } else {
-                format!("scanning library directory {}", dir.display())
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if dir == root => {
+                return Err(err)
+                    .with_context(|| format!("scanning library root {}", dir.display()));
             }
-        })?;
+            Err(err) => {
+                // A subdirectory that vanished or became unreadable must not
+                // abort the whole pass; only the root is fatal.
+                tracing::warn!(
+                    path = %dir.display(),
+                    error = %err,
+                    "skipping unreadable library directory"
+                );
+                continue;
+            }
+        };
         for entry in entries {
-            let entry = entry.with_context(|| format!("reading entry in {}", dir.display()))?;
-            let file_type = entry.file_type()?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %err,
+                        "skipping unreadable library entry"
+                    );
+                    continue;
+                }
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(err) => {
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %err,
+                        "skipping entry with unknown file type"
+                    );
+                    continue;
+                }
+            };
             // Symlinks are skipped as both files and directories: following them
             // can loop forever or escape the library entirely.
             if file_type.is_symlink() {
@@ -294,15 +324,14 @@ fn find_target(
     }
 
     // Lookups return losers as well, so every row is first replaced by its
-    // canonical winner; otherwise a chain A<-B<-C would yield two winners.
+    // canonical winner. The walk follows the whole `duplicate_of` chain: a
+    // single step would stop on an intermediate loser of a chain A<-B<-C,
+    // dethrone C and leave two canonical rows behind.
     let mut canonical: Vec<TrackRecord> = Vec::new();
     for row in found {
-        let row = match row.duplicate_of {
-            Some(winner_id) => match track_by_id(tx, winner_id)? {
-                Some(winner) => winner,
-                None => continue,
-            },
-            None => row,
+        let Some(row) = canonical_track(tx, row)? else {
+            // A dangling reference or a cycle has no canonical row at all.
+            continue;
         };
         if !canonical.iter().any(|seen| seen.id == row.id) {
             canonical.push(row);
@@ -407,6 +436,30 @@ fn acquired_at(metadata: Option<&std::fs::Metadata>) -> String {
 const TRACK_COLUMNS: &str = "id, isrc, match_key, title, artist, album, track_no, \
     duration_sec, lossless, container, bit_depth, sample_rate, bitrate_kbps, \
     size_bytes, path, source_id, acquired_at, duplicate_of";
+
+/// Follow a row's `duplicate_of` chain to the canonical row it belongs to.
+///
+/// Returns `None` when the chain leaves the table or loops back on itself: such
+/// a chain has no canonical row, so it cannot be a dedup target.
+fn canonical_track(conn: &Connection, row: TrackRecord) -> Result<Option<TrackRecord>> {
+    let mut current = row;
+    let mut seen: HashSet<i64> = HashSet::new();
+    seen.insert(current.id);
+    while let Some(winner_id) = current.duplicate_of {
+        if !seen.insert(winner_id) {
+            tracing::warn!(
+                track_id = winner_id,
+                "duplicate_of chain loops, dropping it"
+            );
+            return Ok(None);
+        }
+        match track_by_id(conn, winner_id)? {
+            Some(winner) => current = winner,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(current))
+}
 
 /// Read one row by id. `Db::track_by_id` is private, and `db.rs` is not this
 /// module's to change, so the documented `Connection` access is used instead.
