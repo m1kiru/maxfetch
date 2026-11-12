@@ -19,7 +19,8 @@ const WIDTHS: [Constraint; 4] = [
 
 /// Draws the candidates of the expanded release as a table.
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
-    let title = match app.groups.get(app.selected) {
+    // `selected` is the candidate cursor; the release on screen is `expanded`.
+    let title = match app.expanded.and_then(|index| app.groups.get(index)) {
         Some(group) => format!(
             "Кандидаты: {} — {} ({})",
             group.primary.artist,
@@ -68,15 +69,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         .header(header)
         .column_spacing(1)
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    // No explicit offset: `Table` derives it from the selected row.
     let mut state =
         TableState::default().with_selected(Some(app.selected.min(app.candidates.len() - 1)));
-    *state.offset_mut() = app.results_scroll.offset;
     frame.render_stateful_widget(table, inner, &mut state);
 
-    render_scrollbar(
-        frame,
-        inner,
-        app.candidates.len(),
-        app.results_scroll.position(),
-    );
+    render_scrollbar(frame, inner, app.candidates.len(), state.offset() as u16, 1);
 }

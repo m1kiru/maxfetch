@@ -42,17 +42,13 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let list = List::new(items)
         .block(Block::default())
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-    let mut state = ListState::default()
-        .with_offset(app.results_scroll.offset)
-        .with_selected(Some(app.selected.min(app.groups.len() - 1)));
+    // No explicit offset: `List` derives the first visible row from `selected`,
+    // which is what `Up`/`Down`/`Page*`/`Home`/`End` move.
+    let mut state =
+        ListState::default().with_selected(Some(app.selected.min(app.groups.len() - 1)));
     frame.render_stateful_widget(list, inner, &mut state);
 
-    render_scrollbar(
-        frame,
-        inner,
-        app.groups.len(),
-        app.results_scroll.position(),
-    );
+    render_scrollbar(frame, inner, app.groups.len(), state.offset() as u16, 2);
 }
 
 /// `<artist> — <title>`.

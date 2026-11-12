@@ -13,12 +13,23 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget};
 
-use crate::model::{Candidate, Quality};
+use crate::model::{Candidate, Container, Quality};
 
 /// Renders `scrollbar` over the right edge of `area` when the content is taller
 /// than the panel, and does nothing otherwise so short lists keep a clean edge.
-pub(crate) fn render_scrollbar(frame: &mut Frame, area: Rect, len: usize, position: u16) {
-    if len <= area.height as usize || area.height == 0 {
+///
+/// `lines_per_item` is how many rows one list entry occupies: Results and
+/// Downloads draw two lines per entry, so comparing the item count against the
+/// panel height alone would hide the scrollbar on a list that does overflow.
+pub(crate) fn render_scrollbar(
+    frame: &mut Frame,
+    area: Rect,
+    len: usize,
+    position: u16,
+    lines_per_item: u16,
+) {
+    let rows = len.saturating_mul(usize::from(lines_per_item.max(1)));
+    if rows <= area.height as usize || area.height == 0 {
         return;
     }
     let column = Rect {
@@ -67,7 +78,7 @@ pub(crate) fn human_speed(bytes_per_sec: u64) -> String {
 /// The quality badge of `quality`: `24/48 FLAC` when lossless, `320 kbps Opus`
 /// otherwise, with `?` wherever the source did not say (never invented).
 pub(crate) fn quality_label(quality: &Quality) -> String {
-    let container = quality.container.as_str().to_uppercase();
+    let container = container_label(quality.container);
     if quality.lossless {
         let depth = quality
             .bit_depth
@@ -81,6 +92,23 @@ pub(crate) fn quality_label(quality: &Quality) -> String {
             .bitrate_kbps
             .map_or_else(|| "?".to_string(), |kbps| kbps.to_string());
         format!("{bitrate} kbps {container}")
+    }
+}
+
+/// How a container is spelled for the user: `FLAC`, `Opus`, `MP3`.
+///
+/// The spec asks for `24/48 FLAC` and `320 kbps Opus`, so acronyms stay upper
+/// case while names that are words keep a leading capital.
+fn container_label(container: Container) -> &'static str {
+    match container {
+        Container::Flac => "FLAC",
+        Container::Wav => "WAV",
+        Container::Aiff => "AIFF",
+        Container::Alac => "ALAC",
+        Container::M4aAac => "M4A",
+        Container::Mp3 => "MP3",
+        Container::Opus => "Opus",
+        Container::Webm => "WebM",
     }
 }
 

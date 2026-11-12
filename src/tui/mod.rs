@@ -161,6 +161,11 @@ pub struct App {
     pub query: String,
     pub groups: Vec<ReleaseGroup>,
     pub selected: usize,
+    /// Index into `groups` of the release shown on the Candidates screen.
+    ///
+    /// `selected` is the candidate cursor while Candidates is on screen, so the
+    /// expanded release needs an index of its own.
+    pub expanded: Option<usize>,
     pub candidates: Vec<Candidate>,
     pub downloads: Vec<DownloadItem>,
     pub log: Vec<LogEntry>,
@@ -168,6 +173,8 @@ pub struct App {
     pub status: Vec<SourceStatus>,
     pub results_scroll: ScrollState,
     pub downloads_scroll: ScrollState,
+    /// Highlighted Downloads row; `None` until the list has an item to show.
+    pub downloads_selected: Option<usize>,
     pub should_quit: bool,
     pub(crate) marked: BTreeSet<usize>,
     pub(crate) pending: Vec<Action>,
@@ -184,6 +191,7 @@ impl App {
             query: String::new(),
             groups: Vec::new(),
             selected: 0,
+            expanded: None,
             candidates: Vec::new(),
             downloads: Vec::new(),
             log: Vec::new(),
@@ -191,6 +199,7 @@ impl App {
             status: Vec::new(),
             results_scroll: ScrollState::new(),
             downloads_scroll: ScrollState::new(),
+            downloads_selected: None,
             should_quit: false,
             marked: BTreeSet::new(),
             pending: Vec::new(),
@@ -265,8 +274,8 @@ impl App {
                 _ => {}
             },
             Screen::Results => match key.code {
-                KeyCode::Up => self.move_selection(self.groups.len(), -1),
-                KeyCode::Down => self.move_selection(self.groups.len(), 1),
+                KeyCode::Up => self.move_results_selection(-1),
+                KeyCode::Down => self.move_results_selection(1),
                 KeyCode::PageUp => {
                     let step = self.page_step();
                     self.scroll_results(-step);
@@ -278,12 +287,10 @@ impl App {
                 KeyCode::Home => {
                     let len = self.groups.len() as isize;
                     self.scroll_results(-len);
-                    self.selected = 0;
                 }
                 KeyCode::End => {
                     let len = self.groups.len() as isize;
                     self.scroll_results(len);
-                    self.selected = self.groups.len().saturating_sub(1);
                 }
                 KeyCode::Enter => self.pending.push(Action::Expand),
                 KeyCode::Char(' ') => self.toggle_mark(),
@@ -305,17 +312,19 @@ impl App {
                 KeyCode::Home => {
                     let len = self.candidates.len() as isize;
                     self.scroll_results(-len);
-                    self.selected = 0;
                 }
                 KeyCode::End => {
                     let len = self.candidates.len() as isize;
                     self.scroll_results(len);
-                    self.selected = self.candidates.len().saturating_sub(1);
                 }
                 KeyCode::Enter | KeyCode::Char('d') => {
                     self.pending.push(Action::DownloadMarked);
                 }
-                KeyCode::Esc => self.switch_screen(Screen::Results),
+                KeyCode::Esc => {
+                    // Collapsing forgets which release was open.
+                    self.expanded = None;
+                    self.switch_screen(Screen::Results);
+                }
                 _ => {}
             },
             Screen::Downloads => match key.code {
@@ -375,19 +384,35 @@ impl App {
         Ok(())
     }
 
-    /// Scrolls the results panel (shared with the candidates panel).
+    /// Scrolls the results panel by moving its selection: `ratatui` derives the
+    /// first visible row from the selected index, so an offset alone is ignored.
     pub fn scroll_results(&mut self, delta: isize) {
-        let len = if self.screen == Screen::Candidates {
-            self.candidates.len()
+        if self.screen == Screen::Candidates {
+            self.move_selection(self.candidates.len(), delta);
         } else {
-            self.groups.len()
-        };
-        self.results_scroll.scroll_by(delta, len);
+            self.move_results_selection(delta);
+        }
     }
 
-    /// Scrolls the downloads panel.
+    /// Scrolls the downloads panel by moving its highlight.
     pub fn scroll_downloads(&mut self, delta: isize) {
-        self.downloads_scroll.scroll_by(delta, self.downloads.len());
+        let len = self.downloads.len();
+        if len == 0 {
+            self.downloads_selected = None;
+            self.downloads_scroll.offset = 0;
+            return;
+        }
+        let current = self.downloads_selected.unwrap_or(0);
+        let next = if delta.is_negative() {
+            current.saturating_sub(delta.unsigned_abs())
+        } else {
+            current.saturating_add(delta as usize)
+        };
+        let next = next.min(len - 1);
+        self.downloads_selected = Some(next);
+        // The gauge and the scrollbar follow the highlight rather than their own
+        // offset, so both stay on the row the user is looking at.
+        self.downloads_scroll.offset = next;
     }
 
     /// Records a journal line; the newest entry stays first.
@@ -410,6 +435,24 @@ impl App {
         self.screen = screen;
         self.results_scroll.reset();
         self.downloads_scroll.reset();
+        // Both panels start from the top; the Downloads highlight follows the
+        // offset so the gauge and the list cannot disagree.
+        self.downloads_selected = if self.downloads.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+    }
+
+    /// Appends a Downloads row and keeps the panel highlight inside the list.
+    fn push_download(&mut self, item: DownloadItem) {
+        self.downloads.push(item);
+        let len = self.downloads.len();
+        let selected = self.downloads_selected.unwrap_or(len - 1).min(len - 1);
+        self.downloads_selected = Some(selected);
+        // Keep the public scroll state a mirror of the highlight: the list itself
+        // derives its first visible row from the selection.
+        self.downloads_scroll.offset = selected;
     }
 
     /// `Space` on the Results screen: mark or unmark the selected group.
@@ -438,7 +481,11 @@ impl App {
         }
     }
 
-    /// Moves the selection inside `0..len`, keeping it on screen.
+    /// Moves the selection inside `0..len`.
+    ///
+    /// The panels derive their first visible row from this index while rendering
+    /// (`ratatui` re-computes it from `selected`), so navigation touches no
+    /// scroll state — Settings and Log therefore cannot move the results panel.
     fn move_selection(&mut self, len: usize, delta: isize) {
         if len == 0 {
             self.selected = 0;
@@ -450,25 +497,12 @@ impl App {
             self.selected.saturating_add(delta as usize)
         };
         self.selected = next.min(len - 1);
-        self.reveal_selection(len);
     }
 
-    /// Scrolls just enough to keep the selected row inside the viewport.
-    fn reveal_selection(&mut self, len: usize) {
-        let viewport = self.results_scroll.viewport;
-        if viewport == 0 {
-            return;
-        }
-        let offset = self.results_scroll.offset;
-        if self.selected < offset {
-            self.results_scroll.offset = self.selected;
-        } else if self.selected >= offset + viewport {
-            self.results_scroll.offset = self.selected + 1 - viewport;
-        }
-        let limit = len.saturating_sub(1);
-        if self.results_scroll.offset > limit {
-            self.results_scroll.offset = limit;
-        }
+    /// `Up`/`Down` on Results: moving the cursor forgets the opened release.
+    fn move_results_selection(&mut self, delta: isize) {
+        self.move_selection(self.groups.len(), delta);
+        self.expanded = None;
     }
 
     /// Rows per `PageUp`/`PageDown`: one screen less an overlap row, else ten.
@@ -684,6 +718,7 @@ async fn apply_action(app: &mut App, pipeline: &Pipeline, action: Action) {
                     let found = groups.len();
                     app.groups = groups;
                     app.selected = 0;
+                    app.expanded = None;
                     app.candidates.clear();
                     app.marked.clear();
                     app.results_scroll.reset();
@@ -700,10 +735,14 @@ async fn apply_action(app: &mut App, pipeline: &Pipeline, action: Action) {
                 app.log_line("ошибка", "нечего раскрывать");
                 return;
             };
+            let index = app.selected;
             match pipeline.candidates(&group).await {
                 Ok(candidates) => {
                     let found = candidates.len();
                     app.candidates = candidates;
+                    // The screen keeps its own index of the open release: the
+                    // candidate cursor takes over `selected` from here on.
+                    app.expanded = Some(index);
                     app.selected = 0;
                     app.results_scroll.reset();
                     app.screen = Screen::Candidates;
@@ -735,30 +774,28 @@ async fn apply_action(app: &mut App, pipeline: &Pipeline, action: Action) {
     }
 }
 
-/// Downloads the marked groups, or the selection, or the candidate on screen.
+/// Downloads the marked groups, or the selection, or the candidates on screen.
+///
+/// `best_only` never narrows the candidate list: [`Pipeline::download`] verifies
+/// every candidate in the order it is given and falls back to the next one, so a
+/// truncated list would turn recoverable failures into "не добыто". The flag only
+/// decides which *groups* are fetched — the selection alone instead of the marks.
 async fn download(app: &mut App, pipeline: &Pipeline, best_only: bool) {
     if app.screen == Screen::Candidates {
-        let title = app
-            .groups
-            .get(app.selected)
-            .map(|group| group.primary.title.clone())
-            .unwrap_or_default();
-        let source = app
-            .groups
-            .get(app.selected)
-            .map(|group| group.primary.source)
-            .unwrap_or(SourceId::Soulseek);
-        let candidates: Vec<Candidate> = app
-            .candidates
-            .get(app.selected)
-            .cloned()
-            .into_iter()
-            .collect();
+        // `selected` is the candidate cursor here; the open release lives in
+        // `expanded`, and every candidate of that group is a fallback.
+        let Some(group) = app.expanded.and_then(|index| app.groups.get(index)) else {
+            app.log_line("ошибка", "нечего качать");
+            return;
+        };
+        let title = format!("{} — {}", group.primary.artist, group.primary.title);
+        let source = group.primary.source;
+        let candidates = app.candidates.clone();
         fetch_and_store(app, pipeline, title, source, candidates).await;
         return;
     }
 
-    let indices: Vec<usize> = if app.marked.is_empty() {
+    let indices: Vec<usize> = if best_only || app.marked.is_empty() {
         vec![app.selected]
     } else {
         app.marked.iter().copied().collect()
@@ -778,12 +815,7 @@ async fn download(app: &mut App, pipeline: &Pipeline, best_only: bool) {
                 continue;
             }
         };
-        let chosen: Vec<Candidate> = if best_only {
-            candidates.into_iter().take(1).collect()
-        } else {
-            candidates
-        };
-        fetch_and_store(app, pipeline, title, source, chosen).await;
+        fetch_and_store(app, pipeline, title, source, candidates).await;
     }
 }
 
@@ -796,7 +828,7 @@ async fn fetch_and_store(
     candidates: Vec<Candidate>,
 ) {
     if candidates.is_empty() {
-        app.downloads.push(DownloadItem {
+        app.push_download(DownloadItem {
             title: title.clone(),
             source,
             state: "не добыто".to_string(),
@@ -812,13 +844,16 @@ async fn fetch_and_store(
     let source = candidates.first().map(|c| c.source).unwrap_or(source);
     match pipeline.download(&candidates, &NoopSink).await {
         Ok(result) => {
-            let rejected = result.rejected || result.path.as_os_str().is_empty();
-            let total = if rejected {
+            // `rejected` is sticky in `Pipeline::download`: it stays set after an
+            // attempt fails even when a later candidate succeeds. A delivered
+            // file is the only proof of success, so the path decides.
+            let failed = result.path.as_os_str().is_empty();
+            let total = if failed {
                 None
             } else {
                 std::fs::metadata(&result.path).ok().map(|meta| meta.len())
             };
-            let (state, detail) = if rejected {
+            let (state, detail) = if failed {
                 (
                     "не добыто".to_string(),
                     Some(
@@ -834,7 +869,7 @@ async fn fetch_and_store(
                     Some(result.path.display().to_string()),
                 )
             };
-            app.downloads.push(DownloadItem {
+            app.push_download(DownloadItem {
                 title: title.clone(),
                 source,
                 state: state.clone(),
@@ -851,7 +886,7 @@ async fn fetch_and_store(
         }
         Err(err) => {
             tracing::warn!(error = %err, "download failed");
-            app.downloads.push(DownloadItem {
+            app.push_download(DownloadItem {
                 title: title.clone(),
                 source,
                 state: "ошибка".to_string(),
@@ -862,5 +897,206 @@ async fn fetch_and_store(
             });
             app.log_line("ошибка", format!("{title}: {err}"));
         }
+    }
+}
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the parts `on_key`/`render` cannot reach: the async
+    //! download path, which needs a [`Pipeline`] and a real source.
+
+    use std::path::{Path, PathBuf};
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::db::Db;
+    use crate::fetch::ProgressSink;
+    use crate::matching::ReleaseGroup;
+    use crate::model::{Container, Locator, Quality, Release};
+    use crate::sources::{AuthState, Capabilities, Source};
+
+    /// The first candidate of the group fails, the second is accepted, so
+    /// "не добыто" means the list was truncated to one entry.
+    struct Flaky {
+        requested: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Flaky {
+        fn new() -> Flaky {
+            Flaky {
+                requested: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Source for Flaky {
+        fn id(&self) -> SourceId {
+            SourceId::Soulseek
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                audio: true,
+                metadata_only: false,
+                lossless: true,
+                needs_auth: false,
+            }
+        }
+
+        fn auth_state(&self) -> AuthState {
+            AuthState::NotNeeded
+        }
+
+        async fn search(&self, _q: &Query) -> anyhow::Result<Vec<Release>> {
+            Ok(Vec::new())
+        }
+
+        async fn resolve(&self, _q: &Query) -> anyhow::Result<Vec<Release>> {
+            Ok(Vec::new())
+        }
+
+        async fn candidates(&self, release: &Release) -> anyhow::Result<Vec<Candidate>> {
+            Ok(vec![
+                candidate(release, "first.flac", 24, 96_000),
+                candidate(release, "second.flac", 16, 44_100),
+            ])
+        }
+
+        async fn download(
+            &self,
+            candidate: &Candidate,
+            dest: &Path,
+            _sink: &dyn ProgressSink,
+        ) -> anyhow::Result<()> {
+            if let Ok(mut log) = self.requested.lock() {
+                log.push(match &candidate.locator {
+                    Locator::Soulseek { filename, .. } => filename.clone(),
+                    _ => "other".to_string(),
+                });
+            }
+            if let Locator::Soulseek { filename, .. } = &candidate.locator {
+                if filename == "first.flac" {
+                    anyhow::bail!("peer went away");
+                }
+            }
+            let bytes = std::fs::read(fixture())?;
+            std::fs::write(dest, bytes)?;
+            Ok(())
+        }
+    }
+
+    fn fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe/sine_44100_s16.flac")
+    }
+
+    fn candidate(release: &Release, filename: &str, depth: u8, rate: u32) -> Candidate {
+        Candidate {
+            source: SourceId::Soulseek,
+            release: release.clone(),
+            quality: Quality {
+                lossless: true,
+                container: Container::Flac,
+                bit_depth: Some(depth),
+                sample_rate: Some(rate),
+                bitrate_kbps: None,
+            },
+            size_bytes: Some(1),
+            locator: Locator::Soulseek {
+                username: "peer".to_string(),
+                filename: filename.to_string(),
+                size: 1,
+            },
+        }
+    }
+
+    fn group(title: &str) -> ReleaseGroup {
+        ReleaseGroup {
+            primary: Release {
+                title: title.to_string(),
+                artist: "Daft Punk".to_string(),
+                album: None,
+                track_no: None,
+                duration_sec: None,
+                isrc: None,
+                year: None,
+                source: SourceId::Soulseek,
+                source_item_id: format!("{title}-1"),
+            },
+            members: Vec::new(),
+            sources: vec![SourceId::Soulseek],
+        }
+    }
+
+    fn config_in(root: &Path) -> Config {
+        let mut config = Config::default();
+        config.library.path = root.join("library");
+        config.sources.enabled = vec!["soulseek".to_string()];
+        config
+    }
+
+    fn pipeline(source: Flaky, config: &Config) -> Pipeline {
+        Pipeline::new(
+            config.clone(),
+            Db::open_in_memory().expect("in-memory database"),
+            vec![Box::new(source)],
+        )
+    }
+
+    /// `a` must hand the whole ranked list to the pipeline so a failed first
+    /// candidate falls back instead of reporting "не добыто".
+    #[tokio::test]
+    async fn best_download_keeps_every_candidate_for_the_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_in(dir.path());
+        let source = Flaky::new();
+        let requested = std::sync::Arc::clone(&source.requested);
+        let pipeline = pipeline(source, &config);
+
+        let mut app = App::new(config);
+        app.groups = vec![group("Get Lucky")];
+        app.selected = 0;
+
+        download(&mut app, &pipeline, true).await;
+
+        let attempted: Vec<String> = requested.lock().map(|log| log.clone()).unwrap_or_default();
+        assert_eq!(app.downloads.len(), 1, "one row per group");
+        assert_eq!(
+            app.downloads[0].state, "готово",
+            "the second candidate must be tried after the first fails: {attempted:?} detail={:?}",
+            app.downloads[0].detail,
+        );
+        assert_eq!(attempted.len(), 2, "both candidates were attempted");
+        assert_eq!(
+            app.log.first().map(|entry| entry.level.as_str()),
+            Some("загрузка"),
+        );
+    }
+
+    /// The Candidates screen keeps the candidate cursor in `selected`, so the
+    /// download must address the group named by `expanded`.
+    #[tokio::test]
+    async fn the_candidates_screen_downloads_the_expanded_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = config_in(dir.path());
+        let pipeline = pipeline(Flaky::new(), &config);
+
+        let mut app = App::new(config);
+        app.groups = vec![group("One More Time"), group("Get Lucky")];
+        app.expanded = Some(1);
+        app.selected = 0;
+        app.candidates = vec![
+            candidate(&group("Get Lucky").primary, "second.flac", 16, 44_100),
+            candidate(&group("Another").primary, "second.flac", 16, 44_100),
+        ];
+        app.screen = Screen::Candidates;
+
+        download(&mut app, &pipeline, false).await;
+
+        assert_eq!(app.downloads.len(), 1);
+        assert_eq!(
+            app.downloads[0].title, "Daft Punk — Get Lucky",
+            "the row must be named after the expanded release",
+        );
     }
 }
