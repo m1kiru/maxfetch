@@ -290,21 +290,31 @@ impl ProgressSink for NdjsonSink {
     }
 }
 
-/// One command's view of its output: the pipeline, the writer and the mode.
-struct Session<'a> {
+/// One command's view of its output: the pipeline, the writers and the mode.
+struct Session<'a, 'w> {
     pipeline: &'a Pipeline,
     mode: OutputMode,
     sink: NdjsonSink,
-    out: &'a mut dyn Write,
+    out: &'w mut dyn Write,
+    /// Where NDJSON progress events go. `run` points this at stderr so that the
+    /// payload on stdout stays clean (ruling 8); `run_with` passes `None`, which
+    /// keeps the events in `out`.
+    events: Option<&'w mut dyn Write>,
 }
 
-impl<'a> Session<'a> {
-    fn new(pipeline: &'a Pipeline, mode: OutputMode, out: &'a mut dyn Write) -> Session<'a> {
+impl<'a, 'w> Session<'a, 'w> {
+    fn new(
+        pipeline: &'a Pipeline,
+        mode: OutputMode,
+        out: &'w mut dyn Write,
+        events: Option<&'w mut dyn Write>,
+    ) -> Session<'a, 'w> {
         Session {
             pipeline,
             mode,
             sink: NdjsonSink::new(mode.ndjson),
             out,
+            events,
         }
     }
 
@@ -330,33 +340,51 @@ impl<'a> Session<'a> {
     /// Pushes one event onto the stream and flushes the buffer.
     fn event(&mut self, kind: &str, detail: String) -> Result<()> {
         self.sink.push(kind, detail);
-        self.sink.drain_into(&mut *self.out)
+        self.drain()
     }
 
-    /// Flushes whatever the progress sink accumulated during a download.
+    /// Flushes the event buffer into the event writer, or into `out` when no
+    /// separate event channel was given.
     fn drain(&mut self) -> Result<()> {
-        self.sink.drain_into(&mut *self.out)
+        match self.events.as_mut() {
+            Some(events) => self.sink.drain_into(&mut **events),
+            None => self.sink.drain_into(&mut *self.out),
+        }
     }
 }
 
 /// Runs the CLI with the on-disk configuration of this user.
+///
+/// Stdout carries the command payload only; the NDJSON progress stream goes to
+/// stderr so that `--ndjson-progress` composes with `--json`.
 pub async fn run(cli: Cli) -> Result<()> {
     let dir = config::config_dir();
     let config = Config::load_from(&dir)?;
     let credentials = Credentials::load_from(&dir)?;
     let mut stdout = std::io::stdout();
-    run_with(cli, config, credentials, &mut stdout).await
+    let mut stderr = std::io::stderr();
+    run_with_writers(cli, config, credentials, &mut stdout, Some(&mut stderr)).await
 }
 
 /// Runs the CLI against the given configuration, credentials and writer.
 ///
 /// The credentials guard runs exactly once, here, so `main` and the tests share
-/// one code path.
+/// one code path. With no separate event writer, NDJSON events share `out`.
 pub async fn run_with(
+    cli: Cli,
+    config: Config,
+    credentials: Credentials,
+    out: &mut dyn Write,
+) -> Result<()> {
+    run_with_writers(cli, config, credentials, out, None).await
+}
+
+async fn run_with_writers<'w>(
     cli: Cli,
     mut config: Config,
     credentials: Credentials,
-    out: &mut dyn Write,
+    out: &'w mut dyn Write,
+    events: Option<&'w mut dyn Write>,
 ) -> Result<()> {
     // The guard speaks on stderr: `--json` and `--ndjson-progress` own stdout.
     let mut stderr = std::io::stderr();
@@ -400,7 +428,7 @@ pub async fn run_with(
         json,
         ndjson: ndjson_progress,
     };
-    let mut session = Session::new(&pipeline, mode, out);
+    let mut session = Session::new(&pipeline, mode, out, events);
 
     match command {
         Command::Search { query } => search(&mut session, &query).await,
@@ -572,7 +600,7 @@ impl Columns {
     }
 }
 
-async fn search(session: &mut Session<'_>, text: &str) -> Result<()> {
+async fn search(session: &mut Session<'_, '_>, text: &str) -> Result<()> {
     let query = Query {
         text: Some(text.to_string()),
         ..Query::default()
@@ -611,7 +639,7 @@ async fn search(session: &mut Session<'_>, text: &str) -> Result<()> {
 }
 
 async fn fetch(
-    session: &mut Session<'_>,
+    session: &mut Session<'_, '_>,
     library_root: &Path,
     request: FetchRequest,
     dry_run: bool,
@@ -695,7 +723,7 @@ async fn fetch(
 /// Searches `query`, downloads the best candidate of every group and records
 /// the outcome. A rejected download is "not acquired", never an error.
 async fn download_groups(
-    session: &mut Session<'_>,
+    session: &mut Session<'_, '_>,
     query: &Query,
     acquired: &mut Vec<serde_json::Value>,
     failed: &mut usize,
@@ -742,19 +770,22 @@ async fn download_groups(
 }
 
 fn write_fetch_summary(
-    session: &mut Session<'_>,
+    session: &mut Session<'_, '_>,
     planned: usize,
     acquired: &[serde_json::Value],
     failed: usize,
     dry_run: bool,
 ) -> Result<()> {
     let acquired_count = acquired.len();
+    // The event stream and the JSON payload own different channels (`run` points
+    // the events at stderr), so `--json --ndjson-progress` yields both.
     if session.mode.ndjson {
         session.event(
             "summary",
             format!("запланировано: {planned}, добыто: {acquired_count}, пропущено: {failed}"),
-        )
-    } else if session.mode.json {
+        )?;
+    }
+    if session.mode.json {
         let summary = serde_json::json!({
             "planned": planned,
             "acquired": acquired_count,
@@ -762,8 +793,11 @@ fn write_fetch_summary(
             "tracks": acquired,
         });
         writeln!(session.out, "{}", serde_json::to_string(&summary)?)?;
-        Ok(())
-    } else if dry_run {
+        return Ok(());
+    }
+    // `human` is a no-op whenever stdout carries machine data, so the NDJSON-only
+    // case stops here.
+    if dry_run {
         session.human(&format!("запланировано: {planned}"))
     } else {
         session.human(&format!("добыто: {acquired_count}, пропущено: {failed}"))
@@ -797,7 +831,7 @@ fn query_from_request(request: &FetchRequest) -> Result<Query> {
 }
 
 fn library(
-    session: &mut Session<'_>,
+    session: &mut Session<'_, '_>,
     library_root: &Path,
     command: LibraryCommand,
     dry_run: bool,
@@ -892,7 +926,11 @@ fn confirm_deletion(out: &mut dyn Write) -> Result<bool> {
     Ok(matches!(answer.as_str(), "y" | "yes" | "д" | "да"))
 }
 
-fn auth(credentials: &Credentials, command: AuthCommand, session: &mut Session<'_>) -> Result<()> {
+fn auth(
+    credentials: &Credentials,
+    command: AuthCommand,
+    session: &mut Session<'_, '_>,
+) -> Result<()> {
     match command {
         AuthCommand::Login { source } => {
             session.human(&format!(
@@ -927,7 +965,7 @@ fn credential_sections(credentials: &Credentials) -> Vec<(&'static str, bool)> {
     ]
 }
 
-fn sources_check(session: &mut Session<'_>) -> Result<()> {
+fn sources_check(session: &mut Session<'_, '_>) -> Result<()> {
     let statuses = session.pipeline.source_statuses();
     if statuses.is_empty() {
         session.human("источников нет")?;
@@ -949,7 +987,7 @@ fn config_set(
     config: &mut Config,
     key: &str,
     value: &str,
-    session: &mut Session<'_>,
+    session: &mut Session<'_, '_>,
 ) -> Result<()> {
     match key {
         "library" => {

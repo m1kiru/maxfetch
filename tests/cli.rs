@@ -59,6 +59,125 @@ fn parse(args: &[&str]) -> Cli {
     Cli::try_parse_from(argv).expect("clap parse failed")
 }
 
+/// Runs the real binary with all three XDG roots pointed into `dir` and returns
+/// its captured `(stdout, stderr)`.
+///
+/// The child gets the isolated environment through `Command::env`, so the
+/// process-global environment (and therefore the `ENV_LOCK` protocol) is
+/// untouched and this test can run in parallel with the others.
+fn run_binary(args: &[&str], dir: &tempfile::TempDir) -> (String, String) {
+    let fake = dir.path().join("xdg");
+    fs::create_dir_all(&fake).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_maxfetch"))
+        .args(args)
+        .env("XDG_CONFIG_HOME", &fake)
+        .env("XDG_DATA_HOME", &fake)
+        .env("XDG_STATE_HOME", &fake)
+        .output()
+        .expect("running the maxfetch binary failed");
+    assert!(
+        output.status.success(),
+        "binary exited with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (
+        String::from_utf8(output.stdout).unwrap(),
+        String::from_utf8(output.stderr).unwrap(),
+    )
+}
+
+/// Ruling 8: progress events belong on stderr, so stdout stays a pure payload.
+///
+/// `run_with` keeps both channels in `out` (the mandatory
+/// `ndjson_progress_writes_one_json_object_per_line` test relies on that), but
+/// the binary spawned through `run` must split them.
+#[test]
+fn run_sends_ndjson_events_to_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stdout, stderr) = run_binary(
+        &[
+            "fetch",
+            "--dry-run",
+            "--ndjson-progress",
+            "daft punk get lucky",
+        ],
+        &dir,
+    );
+
+    assert!(
+        stdout.trim().is_empty(),
+        "ndjson events must not land on stdout: {stdout}"
+    );
+
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert!(
+        !lines.is_empty(),
+        "the event stream on stderr must not be empty"
+    );
+    for line in &lines {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|err| panic!("stderr line is not JSON: {line:?}: {err}"));
+        assert!(
+            value.get("event").is_some(),
+            "stderr line lacks the `event` key: {line}"
+        );
+    }
+    let last: serde_json::Value = serde_json::from_str(lines.last().unwrap()).unwrap();
+    assert_eq!(last["event"], "summary");
+}
+
+/// The `--json` payload stays on stdout while the event stream owns stderr.
+#[test]
+fn run_keeps_the_json_payload_on_stdout() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stdout, stderr) = run_binary(&["library", "list", "--json"], &dir);
+
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be one JSON array");
+    assert!(value.is_array(), "whole stdout must be one JSON array");
+    assert!(
+        stderr.trim().is_empty(),
+        "no events are produced by `library list`: {stderr}"
+    );
+}
+
+/// With separate channels the two flags compose: one JSON payload on stdout and
+/// the event stream on stderr, each independently parseable.
+#[test]
+fn run_composes_json_payload_with_ndjson_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let (stdout, stderr) = run_binary(
+        &[
+            "fetch",
+            "--dry-run",
+            "--json",
+            "--ndjson-progress",
+            "daft punk get lucky",
+        ],
+        &dir,
+    );
+
+    let payload: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be one JSON object");
+    assert!(payload.is_object(), "expected a JSON object: {stdout}");
+    assert!(payload.get("planned").is_some(), "missing summary fields");
+
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert!(!lines.is_empty(), "the event stream must not be empty");
+    for line in &lines {
+        let value: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|err| panic!("stderr line is not JSON: {line:?}: {err}"));
+        assert!(value.get("event").is_some(), "line lacks `event`: {line}");
+    }
+}
+
 #[tokio::test]
 async fn dry_run_downloads_nothing_and_reports_the_plan() {
     let dir = tempfile::tempdir().unwrap();
