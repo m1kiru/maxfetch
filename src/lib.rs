@@ -1,5 +1,6 @@
 pub mod config;
 pub mod db;
+pub mod dedup;
 pub mod fetch;
 pub mod library;
 pub mod matching;

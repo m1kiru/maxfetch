@@ -20,7 +20,8 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use crate::config::Config;
-use crate::db::{Db, TrackRecord};
+use crate::db::Db;
+use crate::dedup;
 use crate::fetch::ProgressSink;
 use crate::library::absolute_path;
 use crate::matching::{ReleaseGroup, group_releases, match_key};
@@ -315,40 +316,23 @@ impl Pipeline {
             };
             // Tagging touches the file header, so it is blocking but short.
             let tagged = final_path.clone();
-            let size_bytes = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 write_tags(&tagged, &meta)?;
-                Ok(std::fs::metadata(&tagged)?.len())
+                Ok(())
             })
             .await
             .context("tagging the downloaded file")??;
 
-            let record = TrackRecord {
-                id: 0,
-                isrc: candidate.release.isrc.clone(),
-                match_key: match_key(&candidate.release),
-                title: candidate.release.title.clone(),
-                artist: candidate.release.artist.clone(),
-                album: candidate.release.album.clone(),
-                track_no: candidate.release.track_no,
-                duration_sec: candidate.release.duration_sec,
-                lossless: measured.lossless,
-                container: measured.container,
-                bit_depth: measured.bit_depth,
-                sample_rate: measured.sample_rate,
-                bitrate_kbps: measured.bitrate_kbps,
-                size_bytes: Some(size_bytes),
-                path: final_path.to_string_lossy().into_owned(),
-                source: candidate.source,
-                acquired_at,
-                duplicate_of: None,
-            };
-            // Writing goes through the plain `Db` API for now: the atomic
-            // `dedup::register` primitive arrives with Task 12 and will replace
-            // these two calls. A UNIQUE `path` violation is a real conflict and is
-            // propagated, not swallowed.
-            let id = self.db.insert_track(&record)?;
-            self.db
-                .log_download(candidate.source, Some(id), "acquired", None)?;
+            // The single writer of `tracks`: it deduplicates, sets `duplicate_of`
+            // and journals the download inside one IMMEDIATE transaction.
+            dedup::register(
+                &self.config,
+                &self.db,
+                candidate,
+                &final_path,
+                measured.clone(),
+                candidate.release.duration_sec,
+            )?;
 
             return Ok(DownloadResult {
                 path: final_path,
