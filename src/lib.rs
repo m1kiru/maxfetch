@@ -12,3 +12,4 @@ pub mod probe;
 pub mod quality;
 pub mod sources;
 pub mod tags;
+pub mod tui;
