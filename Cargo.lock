@@ -1523,6 +1523,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "soulseek-rs-lib",
  "symphonia",
  "tempfile",
  "tokio",
@@ -2688,6 +2689,15 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "soulseek-rs-lib"
+version = "20.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41c58ac7d4e037bde148830123d7ad0e1fefa682d19d583b7c24f69c53c080ba"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

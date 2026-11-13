@@ -7,6 +7,8 @@
 //! [`enabled_in`] is the single place where `config.sources.enabled` is turned
 //! into a list of ready-to-use ids.
 
+pub mod soulseek;
+
 use std::path::Path;
 
 use async_trait::async_trait;

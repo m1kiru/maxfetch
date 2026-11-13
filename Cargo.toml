@@ -19,6 +19,7 @@ reqwest = { version = "0.13.5", features = ["json", "stream", "rustls", "cookies
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+soulseek-rs-lib = "20.0.0"
 symphonia = { version = "0.6.1", features = ["all"] }
 tokio = { version = "1.54.1", features = ["full"] }
 toml = "1.2.1"
