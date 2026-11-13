@@ -161,6 +161,11 @@ fn cmp_opt_desc<T: Ord>(a: Option<T>, b: Option<T>) -> Ordering {
 /// Blocking: `recv_timeout(stall_timeout)` is the whole stall guard, so a
 /// peer that simply stops sending samples is detected here and not by the
 /// caller. Progress samples are forwarded to `sink`.
+///
+/// Known limitation: `soulseek-rs-lib` 20.0.0 never publishes `Queued` or
+/// `Paused` on a transfer's own status channel, so those arms only keep the
+/// match exhaustive. A legitimate queue wait longer than `stall_timeout`
+/// therefore looks like `transfer stalled`, and the caller fails over.
 pub fn drain_transfer(
     events: Receiver<DownloadStatus>,
     stall_timeout: Duration,
@@ -228,10 +233,21 @@ pub fn download_ranked(
     let mut last_err: Option<(String, anyhow::Error)> = None;
 
     for peer in ranked {
+        // The crate streams into `dir/<basename>.part` and renames it to
+        // `dir/<basename>` only on a complete transfer, and it deliberately
+        // keeps the `.part` when a transfer breaks off. Both must be gone
+        // before the attempt: the crate resumes whatever `.part` it finds,
+        // whoever wrote it, so bytes of another peer or another size would be
+        // appended to instead of restarting from zero.
+        remove_stale(&remote_path(&part, &peer.filename));
         match transfer.fetch(peer, &part, sink) {
             Ok(_bytes) => {
-                std::fs::rename(&part, dest)
-                    .with_context(|| format!("failed to move {} into place", part.display()))?;
+                let moved = std::fs::rename(&part, dest)
+                    .with_context(|| format!("failed to move {} into place", part.display()));
+                if let Err(err) = moved {
+                    let _ = std::fs::remove_file(&part);
+                    return Err(err);
+                }
                 return Ok(peer.clone());
             }
             Err(err) => {
@@ -267,6 +283,24 @@ fn remote_basename(remote: &str) -> &str {
     remote.rsplit(['/', '\\']).next().unwrap_or(remote)
 }
 
+/// Where the crate itself writes the transfer for `filename`, given the path
+/// handed to [`Transfer::fetch`]: the same directory, remote basename.
+fn remote_path(dest: &Path, filename: &str) -> std::path::PathBuf {
+    dest.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map_or_else(
+            || std::path::PathBuf::from(remote_basename(filename)),
+            |parent| parent.join(remote_basename(filename)),
+        )
+}
+
+/// Deletes `path` and `path.part`, ignoring "not found" and other failures:
+/// leftovers of a previous attempt are best-effort cleanup, not the goal.
+fn remove_stale(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(format!("{}.part", path.display()));
+}
+
 /// Blocking real client. Constructed per `fetch` call, dropped after it.
 struct LibSoulseekTransfer {
     credentials: SoulseekCredentials,
@@ -293,6 +327,14 @@ impl Transfer for LibSoulseekTransfer {
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create download directory {dir}"))?;
 
+        // The crate ignores `dest`: it streams into `dir/<basename>.part` and
+        // renames that to `dir/<basename>` on success. It also resumes any
+        // `.part` shorter than `peer.size`, so whatever an earlier attempt left
+        // at either path has to go before `client.download` picks an offset --
+        // otherwise bytes of a different peer or size are appended to.
+        let written = Path::new(&dir).join(remote_basename(&peer.filename));
+        remove_stale(&written);
+
         let settings = ClientSettings {
             username: self.credentials.username.clone(),
             password: self.credentials.password.clone(),
@@ -308,20 +350,18 @@ impl Transfer for LibSoulseekTransfer {
         // Space search and download so the server does not treat us as flooding.
         std::thread::sleep(Duration::from_millis(500));
 
-        // `_download` must stay alive: dropping it cancels the transfer.
-        let (_download, events) = client.download(
-            peer.filename.clone(),
-            peer.username.clone(),
-            peer.size,
-            dir.clone(),
-        )?;
+        // `_download` is a snapshot of the client's download-store entry, not a
+        // guard: there is no `Drop`-based cancellation in 20.0.0. A transfer
+        // stops only through the store (`Client::cancel_download` ->
+        // `cancel_by_file`), so this binding is kept for the token and status.
+        let (_download, events) =
+            client.download(peer.filename.clone(), peer.username.clone(), peer.size, dir)?;
         let bytes = drain_transfer(
             events,
             Duration::from_secs(self.download.stall_timeout_sec),
             sink,
         )?;
 
-        let written = Path::new(&dir).join(remote_basename(&peer.filename));
         if written.as_path() != dest {
             std::fs::rename(&written, dest)
                 .with_context(|| format!("failed to move {} into place", written.display()))?;

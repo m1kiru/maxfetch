@@ -157,6 +157,62 @@ fn an_interrupted_transfer_leaves_no_partial_file_behind() {
     assert!(!dest.exists());
 }
 
+struct StaleChecker {
+    /// Whether `<basename>` and `<basename>.part` were both absent on entry.
+    clean_on_entry: std::sync::Mutex<Vec<bool>>,
+}
+
+impl Transfer for StaleChecker {
+    fn fetch(
+        &self,
+        _peer: &PeerCandidate,
+        dest: &Path,
+        _sink: &dyn maxfetch::fetch::ProgressSink,
+    ) -> anyhow::Result<u64> {
+        let dir = dest.parent().unwrap();
+        let finished = dir.join("Daft Punk - Get Lucky.flac");
+        let resumed = dir.join("Daft Punk - Get Lucky.flac.part");
+        self.clean_on_entry
+            .lock()
+            .unwrap()
+            .push(!finished.exists() && !resumed.exists());
+        std::fs::write(dest, b"ok")?;
+        Ok(2)
+    }
+}
+
+#[test]
+fn every_attempt_removes_the_crates_leftover_files_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("track.flac");
+    let finished = dir.path().join("Daft Punk - Get Lucky.flac");
+    let resumed = dir.path().join("Daft Punk - Get Lucky.flac.part");
+    std::fs::write(&finished, [7u8; 4]).unwrap();
+    std::fs::write(&resumed, vec![0u8; 4096]).unwrap();
+    let checker = StaleChecker {
+        clean_on_entry: std::sync::Mutex::new(Vec::new()),
+    };
+    let chosen = download_ranked(&checker, &[peer("good")], &dest, &NoopSink).unwrap();
+    assert_eq!(chosen.username, "good");
+    assert_eq!(checker.clean_on_entry.lock().unwrap().clone(), vec![true]);
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "ok");
+    assert!(!finished.exists());
+    assert!(!resumed.exists());
+}
+
+#[test]
+fn a_failed_rename_does_not_leave_the_partial_file_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("track.flac");
+    // A directory squatting on `dest` makes the final rename fail.
+    std::fs::create_dir(&dest).unwrap();
+    let script = Script {
+        script: std::sync::Mutex::new(vec![true]),
+    };
+    assert!(download_ranked(&script, &[peer("good")], &dest, &NoopSink).is_err());
+    assert!(!dir.path().join("track.part").exists());
+}
+
 #[test]
 fn an_empty_peer_list_is_an_error() {
     let dir = tempfile::tempdir().unwrap();
