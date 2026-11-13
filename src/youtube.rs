@@ -2,11 +2,16 @@
 //! There are no network calls here: the binary is only ever started by an
 //! explicit path handed in by the caller.
 
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::Context;
 
+use crate::fetch::ProgressSink;
+use crate::media::{remux_to_opus, write_sidecar};
 use crate::model::{Container, Quality};
+use crate::probe::probe;
 
 /// One video from a flat playlist listing.
 #[derive(Clone, Debug, PartialEq)]
@@ -227,4 +232,212 @@ pub fn binary_status(path: &str) -> Option<String> {
 /// True for any URL carrying a `list=` query parameter.
 pub fn is_playlist_url(url: &str) -> bool {
     url.contains("list=")
+}
+
+/// What [`finalize`] left on disk and whether it can still be tagged.
+///
+/// `untagged` means "a sidecar JSON sits next to the media file", not "the
+/// media file lacks embedded tags": tagging is out of scope here.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FinalizedAudio {
+    pub path: PathBuf,
+    pub container: Container,
+    pub untagged: bool,
+    pub sidecar: Option<PathBuf>,
+}
+
+/// Downloads the best audio stream of `url` into `work_dir`.
+///
+/// The output template is `<work_dir>/<video_id>.%(ext)s`, so exactly one file
+/// with that stem is expected. A `yt-dlp` failure is reported with the tail of
+/// its stderr. Progress is not parsed: only [`ProgressSink::on_finished`] runs.
+pub fn download_audio(
+    yt_dlp_path: &str,
+    video_id: &str,
+    url: &str,
+    work_dir: &Path,
+    sink: &dyn ProgressSink,
+) -> anyhow::Result<PathBuf> {
+    let template = format!("{}/{}.%(ext)s", work_dir.display(), video_id);
+    let output = Command::new(yt_dlp_path)
+        .args(["-f", "bestaudio", "-o", &template, url])
+        .output()
+        .with_context(|| format!("не удалось запустить yt-dlp: {yt_dlp_path}"))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "yt-dlp завершился с кодом {}: {}",
+            output.status,
+            tail_of(&output.stderr)
+        );
+    }
+
+    let mut found: Vec<PathBuf> = std::fs::read_dir(work_dir)
+        .with_context(|| format!("reading work directory {}", work_dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.file_stem() == Some(OsStr::new(video_id)))
+        .collect();
+    found.sort();
+
+    match found.len() {
+        1 => {
+            let path = found.remove(0);
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            sink.on_finished(size);
+            Ok(path)
+        }
+        0 => anyhow::bail!(
+            "yt-dlp не создал файл для {video_id} в {}: {}",
+            work_dir.display(),
+            list_dir(work_dir)
+        ),
+        _ => anyhow::bail!(
+            "yt-dlp создал несколько файлов для {video_id}: {}",
+            found
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Remuxes `downloaded` into `dest`, falling back to a sidecar on failure.
+///
+/// The remux writes to `<dest>.tmp.opus` first because `ffmpeg` picks the muxer
+/// from the output extension and `dest` may be `<uuid>.part`. When the remux
+/// fails the downloaded bytes are copied as is, a JSON sidecar is written next
+/// to `dest` and `untagged` is set. In both branches `container` comes from
+/// [`probe`], never from the file name.
+pub fn finalize(
+    ffmpeg_path: &str,
+    downloaded: &Path,
+    dest: &Path,
+    video_id: &str,
+    meta: &YoutubeTrackMeta,
+) -> anyhow::Result<FinalizedAudio> {
+    let temp = remux_temp_path(dest);
+
+    let (untagged, sidecar) = match remux_to_opus(ffmpeg_path, downloaded, &temp) {
+        Ok(()) => {
+            std::fs::rename(&temp, dest)
+                .with_context(|| format!("moving {} to {}", temp.display(), dest.display()))?;
+            // The source file is no longer needed; a failure to remove it is
+            // not worth masking a successful finalize.
+            let _ = std::fs::remove_file(downloaded);
+            (false, None)
+        }
+        Err(error) => {
+            tracing::warn!(
+                video_id,
+                error = %error,
+                "remux to opus failed; keeping the downloaded bytes and writing a sidecar"
+            );
+            let _ = std::fs::remove_file(&temp);
+            std::fs::copy(downloaded, dest).with_context(|| {
+                format!("copying {} to {}", downloaded.display(), dest.display())
+            })?;
+            write_sidecar(dest, &sidecar_payload(video_id, meta))?;
+            (true, Some(sidecar_path(dest)))
+        }
+    };
+
+    let container = match probe(dest) {
+        Ok(result) => result.container,
+        Err(error) => {
+            tracing::warn!(
+                dest = %dest.display(),
+                error = %error,
+                "probe failed on the finished file"
+            );
+            // known limitation: unprobeable bytes are reported as Webm
+            Container::Webm
+        }
+    };
+
+    Ok(FinalizedAudio {
+        path: dest.to_path_buf(),
+        container,
+        untagged,
+        sidecar,
+    })
+}
+
+/// JSON written next to an untagged file so the metadata is not lost.
+pub fn sidecar_payload(video_id: &str, meta: &YoutubeTrackMeta) -> serde_json::Value {
+    serde_json::json!({
+        "source": "youtube",
+        "video_id": video_id,
+        "title": meta.title,
+        "artist": meta.artist,
+        "album": meta.album,
+    })
+}
+
+/// True when `path` and its `<path>.json` sidecar both exist.
+pub fn untagged(path: &Path) -> bool {
+    path.exists() && sidecar_path(path).exists()
+}
+
+/// Renames `<temp_media>.json` onto `<final_media>.json`.
+///
+/// Returns the new sidecar path, or `None` when the media file never had one.
+/// The destination directory must already exist.
+pub fn move_sidecar(temp_media: &Path, final_media: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let from = sidecar_path(temp_media);
+    if !from.exists() {
+        return Ok(None);
+    }
+    let to = sidecar_path(final_media);
+    std::fs::rename(&from, &to)
+        .with_context(|| format!("moving sidecar {} to {}", from.display(), to.display()))?;
+    Ok(Some(to))
+}
+
+/// Path of the sidecar: `.json` appended to the whole file name.
+fn sidecar_path(path: &Path) -> PathBuf {
+    let mut raw = path.as_os_str().to_os_string();
+    raw.push(".json");
+    PathBuf::from(raw)
+}
+
+/// Temporary remux target next to `dest` with an `.opus` extension.
+///
+/// The extension matters: `ffmpeg` chooses the muxer from it, and `dest` itself
+/// may carry an unrelated extension such as `.part`.
+fn remux_temp_path(dest: &Path) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dest.with_file_name(format!("{name}.tmp.opus"))
+}
+
+/// Last ~500 characters of `bytes`, for stderr diagnostics.
+fn tail_of(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let count = text.chars().count();
+    let skip = count.saturating_sub(500);
+    text.chars()
+        .skip(skip)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Comma-separated listing of `dir`, for "nothing was produced" diagnostics.
+fn list_dir(dir: &Path) -> String {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        "<empty>".to_string()
+    } else {
+        names.join(", ")
+    }
 }
