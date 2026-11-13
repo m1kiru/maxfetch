@@ -1,21 +1,27 @@
 //! Bandcamp URL classification, tralbum metadata and promo archives.
 //!
-//! There is no HTTP here: recorded pages are replayed by the test harness
-//! instead of being fetched, and the download chain is a pure URL/metadata
-//! computation. The filesystem is touched only by the archive layer
-//! ([`is_zip`], [`unpack_archive`], [`unpack_cached`]) and its private listing.
+//! The module is split in three layers: the pure parsers of the recorded pages
+//! and JSON payloads, the filesystem archive layer ([`is_zip`],
+//! [`unpack_archive`], [`unpack_cached`]) and [`BandcampSource`], the single
+//! network consumer. The module owns no global client and performs no request
+//! at import time; every HTTP call happens inside a `BandcampSource` method.
 
 use std::fs::File;
 use std::io::{Read, copy};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
+use async_trait::async_trait;
 use chrono::Datelike;
 use regex::Regex;
 use serde_json::{Map, Value};
 
-use crate::model::{Container, Quality, Release, SourceId};
+use crate::config::{Config, Credentials, DownloadConfig};
+use crate::fetch::{ProgressSink, http_client};
+use crate::model::{Candidate, Container, Locator, Quality, Release, SourceId};
+use crate::sources::{AuthState, Capabilities, Query, Source};
 
 /// Which kind of tralbum page a Bandcamp id pair describes.
 ///
@@ -752,4 +758,757 @@ pub fn track_number_from_stem(stem: &str) -> Option<u32> {
     } else {
         digits.parse().ok()
     }
+}
+
+/// Whether a release offers a free promo download.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PromoAvailability {
+    Free,
+    PaidOnly,
+    Unavailable,
+}
+
+impl PromoAvailability {
+    /// The user-facing line describing the availability.
+    pub fn message(&self) -> &'static str {
+        match self {
+            PromoAvailability::Free => "бесплатное промо",
+            PromoAvailability::PaidOnly | PromoAvailability::Unavailable => "нет бесплатного промо",
+        }
+    }
+
+    /// Whether a promo archive can be fetched at all.
+    pub fn is_free(&self) -> bool {
+        matches!(self, PromoAvailability::Free)
+    }
+}
+
+/// Classifies a parsed tralbum by its free-download flag and its store flags.
+pub fn promo_availability(release: &BandcampRelease) -> PromoAvailability {
+    if release.free_download {
+        PromoAvailability::Free
+    } else if release.is_purchasable || release.has_digital_download {
+        PromoAvailability::PaidOnly
+    } else {
+        PromoAvailability::Unavailable
+    }
+}
+
+/// The parts of a Bandcamp locator as understood by the source.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BandcampTarget {
+    /// The download (or retry) URL without the archive-member fragment.
+    pub request_url: String,
+    /// The archive member name carried percent-decoded in the fragment.
+    pub member: Option<String>,
+    /// The Bandcamp free-download format key.
+    pub encoding: String,
+    /// The tralbum id recovered from the `request_url` query, when present.
+    pub tralbum_id: Option<u64>,
+}
+
+/// Builds a locator that addresses one member of a promo archive.
+pub fn make_member_locator(request_url: &str, member: &str, encoding: &str) -> Locator {
+    Locator::Bandcamp {
+        url: format!("{request_url}#{member}"),
+        encoding: encoding.to_owned(),
+    }
+}
+
+/// Reads a Bandcamp locator back into its parts; a foreign locator is `None`.
+pub fn parse_locator(loc: &Locator) -> Option<BandcampTarget> {
+    let Locator::Bandcamp { url, encoding } = loc else {
+        return None;
+    };
+    let (request_url, member) = match url.split_once('#') {
+        Some((request_url, fragment)) => (request_url, Some(percent_decode(fragment))),
+        None => (url.as_str(), None),
+    };
+    Some(BandcampTarget {
+        request_url: request_url.to_owned(),
+        member,
+        encoding: encoding.clone(),
+        tralbum_id: tralbum_id_from_url(request_url),
+    })
+}
+
+/// Recovers the tralbum id from the retry URL query, most specific name first.
+fn tralbum_id_from_url(url: &str) -> Option<u64> {
+    ["tralbum_id", "album_id", "id"]
+        .into_iter()
+        .find_map(|name| query_param(url, name).and_then(|raw| raw.parse().ok()))
+}
+
+/// The value of the first query parameter called `name`.
+fn query_param<'a>(url: &'a str, name: &str) -> Option<&'a str> {
+    let (_, query) = url.split_once('?')?;
+    query.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then_some(value)
+    })
+}
+
+/// Decodes `%XX` escapes; invalid escapes are kept verbatim.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
+            if let Some(byte) = hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+                decoded.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// Percent-encodes everything except the RFC 3986 unreserved characters.
+fn percent_encode(text: &str) -> String {
+    let mut encoded = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            b' ' => encoded.push_str("%20"),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+/// The path part of a URL, with the query string removed.
+fn url_path(url: &str) -> &str {
+    match url.split_once('?') {
+        Some((path, _)) => path,
+        None => url,
+    }
+}
+
+/// Classifies a URL by its path alone; the host is not consulted.
+fn page_kind(url: &str) -> TralbumKind {
+    let path = url_path(url);
+    if path.contains("/track/") {
+        TralbumKind::Track
+    } else if path.contains("/album/") {
+        TralbumKind::Album
+    } else {
+        TralbumKind::Artist
+    }
+}
+
+/// Maps a page kind to the `tralbum_type` an API call needs.
+fn tralbum_type_of(kind: TralbumKind) -> TralbumType {
+    match kind {
+        TralbumKind::Track => TralbumType::Track,
+        TralbumKind::Album | TralbumKind::Artist => TralbumType::Album,
+    }
+}
+
+/// Builds the track-level [`Release`] of one matched archive member.
+///
+/// [`BandcampRelease::to_releases`] drops non-streamable tracks, so a member
+/// cannot be indexed by its position there; this repeats the same fields for
+/// the track that was actually matched.
+fn release_from_track(tralbum: &BandcampRelease, page_url: &str, track: &BandcampTrack) -> Release {
+    Release {
+        title: track.title.clone(),
+        artist: tralbum.artist.clone(),
+        album: (!track.album_title.is_empty()).then(|| track.album_title.clone()),
+        track_no: Some(track.track_num),
+        duration_sec: Some(track.duration_sec),
+        isrc: None,
+        year: chrono::DateTime::from_timestamp(tralbum.release_date_unix as i64, 0)
+            .map(|date| date.year()),
+        source: SourceId::Bandcamp,
+        source_item_id: format!("{page_url}|{}", track.track_id),
+    }
+}
+
+/// Finds an already unpacked member under any tralbum of the cache.
+fn find_member_in_cache(cache_root: &Path, member: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(cache_root.join("bandcamp")).ok()?;
+    for entry in entries.flatten() {
+        let mut path = entry.path().join("members");
+        for segment in member.split('/').filter(|segment| !segment.is_empty()) {
+            path.push(crate::library::sanitize_component(segment));
+        }
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// The Bandcamp API hosts the source talks to.
+#[derive(Clone, Debug)]
+pub struct BandcampEndpoints {
+    pub api_base: String,
+}
+
+impl BandcampEndpoints {
+    pub fn production() -> BandcampEndpoints {
+        BandcampEndpoints {
+            api_base: "https://bandcamp.com".to_owned(),
+        }
+    }
+}
+
+/// A promo archive fetched and unpacked for one tralbum.
+struct PromoCached {
+    request_url: String,
+    encoding: String,
+    single_track: bool,
+    entries: Vec<ArchiveEntry>,
+}
+
+/// Bandcamp as a [`Source`].
+#[derive(Clone)]
+pub struct BandcampSource {
+    endpoints: BandcampEndpoints,
+    client: reqwest::Client,
+    cache_root: PathBuf,
+}
+
+impl BandcampSource {
+    /// The production source: the real Bandcamp hosts and the default cache.
+    pub fn new(config: &Config, _credentials: &Credentials) -> BandcampSource {
+        let client = match http_client(config.download.timeout_sec) {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!("не удалось создать HTTP-клиент Bandcamp: {error}");
+                reqwest::Client::new()
+            }
+        };
+        Self::from_parts(
+            BandcampEndpoints::production(),
+            client,
+            cache_root_default(),
+        )
+    }
+
+    /// A source pointed at `api_base` and at an explicit cache root.
+    pub fn with_api_base(api_base: &str, cache_root: &Path) -> BandcampSource {
+        let client = http_client(DownloadConfig::default().timeout_sec).unwrap_or_else(|error| {
+            tracing::warn!("не удалось создать HTTP-клиент Bandcamp: {error}");
+            reqwest::Client::new()
+        });
+        Self::from_parts(
+            BandcampEndpoints {
+                api_base: api_base.trim_end_matches('/').to_owned(),
+            },
+            client,
+            cache_root.to_path_buf(),
+        )
+    }
+
+    /// Assembles the source and prepares the cache root best-effort.
+    fn from_parts(
+        endpoints: BandcampEndpoints,
+        client: reqwest::Client,
+        cache_root: PathBuf,
+    ) -> BandcampSource {
+        if let Err(error) = std::fs::create_dir_all(&cache_root) {
+            tracing::warn!(
+                "не удалось создать каталог кэша {}: {error}",
+                cache_root.display()
+            );
+        }
+        BandcampSource {
+            endpoints,
+            client,
+            cache_root,
+        }
+    }
+
+    /// Sends a request and returns its status with the body as text.
+    async fn fetch_text(&self, url: &str) -> anyhow::Result<(u16, String)> {
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("запрос не удался: {url}"))?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .with_context(|| format!("не удалось прочитать тело ответа: {url}"))?;
+        Ok((status, body))
+    }
+
+    /// Sends a request and returns its status with the body as bytes.
+    async fn fetch_bytes(&self, url: &str) -> anyhow::Result<(u16, Vec<u8>)> {
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .with_context(|| format!("запрос не удался: {url}"))?;
+        let status = response.status().as_u16();
+        let body = response
+            .bytes()
+            .await
+            .with_context(|| format!("не удалось прочитать тело ответа: {url}"))?
+            .to_vec();
+        Ok((status, body))
+    }
+
+    /// Reads one tralbum through `/api/mobile/25/tralbum_details`.
+    async fn tralbum(
+        &self,
+        band_id: u64,
+        tralbum_id: u64,
+        kind: TralbumType,
+    ) -> anyhow::Result<BandcampRelease> {
+        let url = format!(
+            "{}/api/mobile/25/tralbum_details?band_id={band_id}&tralbum_id={tralbum_id}&tralbum_type={}",
+            self.endpoints.api_base,
+            kind.as_str()
+        );
+        let (status, body) = self.fetch_text(&url).await?;
+        if !(200..300).contains(&status) {
+            anyhow::bail!("tralbum_details ответил статусом {status}: {url}");
+        }
+        parse_tralbum_details(&body).with_context(|| format!("tralbum_details: {url}"))
+    }
+
+    /// Reads a tralbum and maps its streamable tracks onto `page_url`.
+    async fn releases_for_tralbum(
+        &self,
+        band_id: u64,
+        tralbum_id: u64,
+        kind: TralbumType,
+        page_url: &str,
+    ) -> anyhow::Result<Vec<Release>> {
+        Ok(self
+            .tralbum(band_id, tralbum_id, kind)
+            .await?
+            .to_releases(page_url))
+    }
+
+    /// Runs the promo chain, writes the archive to the cache and unpacks it.
+    async fn promo_archive(
+        &self,
+        tralbum: &BandcampRelease,
+        free_download_page: &str,
+    ) -> anyhow::Result<Option<PromoCached>> {
+        let (status, body) = self.fetch_bytes(free_download_page).await?;
+        let (request_url, body) = if (200..300).contains(&status) {
+            (free_download_page.to_owned(), body)
+        } else {
+            if is_expired_download(status, &String::from_utf8_lossy(&body)) {
+                tracing::debug!("промо-ссылка Bandcamp просрочена: {free_download_page}");
+            }
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.subsec_nanos() as u64)
+                .unwrap_or(0);
+            let Some(statdownload_url) = statdownload_url(free_download_page, nonce) else {
+                return Ok(None);
+            };
+            let (stat_status, stat_body) = self.fetch_text(&statdownload_url).await?;
+            if !(200..300).contains(&stat_status) {
+                return Ok(None);
+            }
+            let Some(retry_url) =
+                parse_statdownload_result(&stat_body).and_then(|result| result.retry_url)
+            else {
+                return Ok(None);
+            };
+            let (retry_status, retry_body) = self.fetch_bytes(&retry_url).await?;
+            if !(200..300).contains(&retry_status) {
+                return Ok(None);
+            }
+            (retry_url, retry_body)
+        };
+
+        let zip_path = archive_zip_path(&self.cache_root, tralbum.tralbum_id);
+        if let Some(parent) = zip_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("создание каталога кэша {}", parent.display()))?;
+        }
+        std::fs::write(&zip_path, &body)
+            .with_context(|| format!("запись архива {}", zip_path.display()))?;
+
+        let encoding = retry_encoding(&request_url);
+        let single_track = url_path(&request_url).contains("/download/track")
+            || tralbum.tralbum_type == TralbumType::Track;
+        if single_track {
+            return Ok(Some(PromoCached {
+                request_url,
+                encoding,
+                single_track,
+                entries: Vec::new(),
+            }));
+        }
+
+        if !is_zip(&zip_path)? {
+            tracing::warn!(
+                "{}: {} — {}",
+                tralbum.artist,
+                tralbum.title,
+                "страница загрузки вернула не архив"
+            );
+            return Ok(None);
+        }
+
+        let entries = unpack_cached(&zip_path, &self.cache_root, tralbum.tralbum_id)?;
+        Ok(Some(PromoCached {
+            request_url,
+            encoding,
+            single_track,
+            entries,
+        }))
+    }
+
+    /// Fetches a promo archive into the cache of `tralbum_id`.
+    async fn write_archive(&self, url: &str, tralbum_id: u64) -> anyhow::Result<PathBuf> {
+        let (status, body) = self.fetch_bytes(url).await?;
+        if !(200..300).contains(&status) {
+            anyhow::bail!("архив Bandcamp недоступен: {url} (статус {status})");
+        }
+        let zip_path = archive_zip_path(&self.cache_root, tralbum_id);
+        if let Some(parent) = zip_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("создание каталога кэша {}", parent.display()))?;
+        }
+        std::fs::write(&zip_path, body)
+            .with_context(|| format!("запись архива {}", zip_path.display()))?;
+        Ok(zip_path)
+    }
+
+    /// Locates one unpacked member, re-fetching the archive when the cache was cleared.
+    async fn member_file(
+        &self,
+        target: &BandcampTarget,
+        name: &str,
+    ) -> anyhow::Result<Option<PathBuf>> {
+        if let Some(id) = target.tralbum_id {
+            let zip_path = archive_zip_path(&self.cache_root, id);
+            if zip_path.is_file() {
+                let entries = unpack_cached(&zip_path, &self.cache_root, id)?;
+                return Ok(entries
+                    .into_iter()
+                    .find(|entry| entry.member == name)
+                    .map(|entry| entry.path));
+            }
+        }
+        if let Some(path) = find_member_in_cache(&self.cache_root, name) {
+            return Ok(Some(path));
+        }
+        let Some(id) = target.tralbum_id else {
+            return Ok(None);
+        };
+        self.write_archive(&target.request_url, id).await?;
+        let entries = unpack_cached(
+            &archive_zip_path(&self.cache_root, id),
+            &self.cache_root,
+            id,
+        )?;
+        Ok(entries
+            .into_iter()
+            .find(|entry| entry.member == name)
+            .map(|entry| entry.path))
+    }
+}
+
+#[async_trait]
+impl Source for BandcampSource {
+    fn id(&self) -> SourceId {
+        SourceId::Bandcamp
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            audio: true,
+            metadata_only: false,
+            lossless: true,
+            needs_auth: false,
+        }
+    }
+
+    fn auth_state(&self) -> AuthState {
+        AuthState::NotNeeded
+    }
+
+    async fn search(&self, q: &Query) -> anyhow::Result<Vec<Release>> {
+        let text = q
+            .text
+            .as_deref()
+            .or(q.url.as_deref())
+            .map(str::trim)
+            .unwrap_or("");
+        // untested: no plan test covers a text query
+        if text.is_empty() {
+            anyhow::bail!("пустой поисковый запрос");
+        }
+        let url = format!(
+            "{}/api/fuzzysearch/2/app_autocomplete?q={}&param_with_locations=true",
+            self.endpoints.api_base,
+            percent_encode(text)
+        );
+        let (status, body) = self.fetch_text(&url).await?;
+        if !(200..300).contains(&status) {
+            anyhow::bail!("поиск Bandcamp ответил статусом {status}: {url}");
+        }
+        let hits = parse_fuzzy_search(&body)?;
+
+        let mut releases: Vec<Release> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for hit in hits
+            .into_iter()
+            .filter(|hit| matches!(hit.kind, TralbumKind::Album | TralbumKind::Track))
+            .take(5)
+        {
+            let Some(band_id) = hit.band_id else {
+                tracing::debug!("поиск Bandcamp: у результата нет band_id, пропуск");
+                continue;
+            };
+            let page_url = hit.location.as_deref().map(url_path).unwrap_or("");
+            let kind = tralbum_type_of(hit.kind);
+            for release in self
+                .releases_for_tralbum(band_id, hit.id, kind, page_url)
+                .await?
+            {
+                if seen.insert(release.source_item_id.clone()) {
+                    releases.push(release);
+                }
+            }
+        }
+        Ok(releases)
+    }
+
+    async fn resolve(&self, q: &Query) -> anyhow::Result<Vec<Release>> {
+        let url = q
+            .url
+            .as_deref()
+            .or(q.text.as_deref())
+            .map(str::trim)
+            .unwrap_or("");
+        if url.is_empty() {
+            anyhow::bail!("пустая ссылка Bandcamp");
+        }
+
+        match page_kind(url) {
+            TralbumKind::Track | TralbumKind::Album => {
+                let (status, page) = self.fetch_text(url).await?;
+                let ids = (200..300)
+                    .contains(&status)
+                    .then(|| parse_bandcamp_ids(&page))
+                    .flatten();
+                let Some(ids) = ids else {
+                    tracing::info!("нет бесплатного промо: {url}");
+                    return Ok(Vec::new());
+                };
+                let kind = tralbum_type_of(page_kind(url));
+                self.releases_for_tralbum(ids.band_id, ids.tralbum_id, kind, url)
+                    .await
+            }
+            TralbumKind::Artist => {
+                let (status, page) = self.fetch_text(url).await?;
+                let band_id = (200..300)
+                    .contains(&status)
+                    .then(|| parse_bandcamp_ids(&page).map(|ids| ids.band_id))
+                    .flatten()
+                    .or_else(|| query_param(url, "band_id").and_then(|raw| raw.parse().ok()));
+                let Some(band_id) = band_id else {
+                    tracing::info!("дискография пуста: {url}");
+                    return Ok(Vec::new());
+                };
+                let details_url = format!(
+                    "{}/api/mobile/24/band_details?band_id={band_id}",
+                    self.endpoints.api_base
+                );
+                let (details_status, details_body) = self.fetch_text(&details_url).await?;
+                let items = if (200..300).contains(&details_status) {
+                    parse_band_details(&details_body)?
+                } else {
+                    Vec::new()
+                };
+                if items.is_empty() {
+                    tracing::info!("дискография пуста: {url}");
+                    return Ok(Vec::new());
+                }
+                let mut releases = Vec::new();
+                for item in items {
+                    releases.extend(
+                        self.releases_for_tralbum(band_id, item.item_id, item.item_type, url)
+                            .await?,
+                    );
+                }
+                Ok(releases)
+            }
+        }
+    }
+
+    async fn candidates(&self, release: &Release) -> anyhow::Result<Vec<Candidate>> {
+        let Some((page_url, _track_id)) = split_source_item_id(&release.source_item_id) else {
+            tracing::warn!(
+                "{}: {} — некорректный source_item_id: {}",
+                release.artist,
+                release.title,
+                release.source_item_id
+            );
+            return Ok(Vec::new());
+        };
+        let (status, page) = self.fetch_text(page_url).await?;
+        let page_ids = (200..300)
+            .contains(&status)
+            .then(|| parse_bandcamp_ids(&page))
+            .flatten();
+        let free_download_page = (200..300)
+            .contains(&status)
+            .then(|| parse_data_tralbum(&page).and_then(|blob| blob.free_download_page))
+            .flatten();
+        let (Some(ids), Some(free_download_page)) = (page_ids, free_download_page) else {
+            tracing::info!(
+                "{}: {} — {}",
+                release.artist,
+                release.title,
+                "нет бесплатного промо"
+            );
+            return Ok(Vec::new());
+        };
+
+        let tralbum = self
+            .tralbum(
+                ids.band_id,
+                ids.tralbum_id,
+                tralbum_type_of(page_kind(page_url)),
+            )
+            .await?;
+        let availability = promo_availability(&tralbum);
+        if !availability.is_free() {
+            tracing::info!(
+                "{}: {} — {}",
+                release.artist,
+                release.title,
+                availability.message()
+            );
+            return Ok(Vec::new());
+        }
+
+        let Some(promo) = self.promo_archive(&tralbum, &free_download_page).await? else {
+            tracing::info!(
+                "{}: {} — {}",
+                release.artist,
+                release.title,
+                "нет бесплатного промо"
+            );
+            return Ok(Vec::new());
+        };
+
+        if promo.single_track {
+            let Some(quality) = format_quality(&promo.encoding) else {
+                if let Some(track) = tralbum.tracks.first() {
+                    tracing::warn!(
+                        "неизвестный формат {} у трека {}",
+                        promo.encoding,
+                        track.title
+                    );
+                }
+                return Ok(Vec::new());
+            };
+            let candidate_release = match tralbum.tracks.first() {
+                Some(track) => release_from_track(&tralbum, page_url, track),
+                None => release.clone(),
+            };
+            return Ok(vec![Candidate {
+                source: SourceId::Bandcamp,
+                release: candidate_release,
+                quality,
+                size_bytes: None,
+                locator: Locator::Bandcamp {
+                    url: promo.request_url,
+                    encoding: promo.encoding,
+                },
+            }]);
+        }
+
+        let Some(quality) = format_quality(&promo.encoding) else {
+            for (_, track) in match_members_to_tracks(&promo.entries, &tralbum.tracks) {
+                tracing::warn!(
+                    "неизвестный формат {} у трека {}",
+                    promo.encoding,
+                    track.title
+                );
+            }
+            return Ok(Vec::new());
+        };
+
+        let mut candidates = Vec::new();
+        for (entry, track) in match_members_to_tracks(&promo.entries, &tralbum.tracks) {
+            candidates.push(Candidate {
+                source: SourceId::Bandcamp,
+                release: release_from_track(&tralbum, page_url, &track),
+                quality: quality.clone(),
+                size_bytes: None,
+                locator: make_member_locator(&promo.request_url, &entry.member, &promo.encoding),
+            });
+        }
+        Ok(candidates)
+    }
+
+    async fn download(
+        &self,
+        candidate: &Candidate,
+        dest: &Path,
+        sink: &dyn ProgressSink,
+    ) -> anyhow::Result<()> {
+        let Locator::Bandcamp { .. } = &candidate.locator else {
+            anyhow::bail!("кандидат не принадлежит Bandcamp");
+        };
+        let Some(target) = parse_locator(&candidate.locator) else {
+            anyhow::bail!("некорректный локатор Bandcamp");
+        };
+
+        let source_file = if let Some(name) = target.member.as_deref() {
+            match self.member_file(&target, name).await? {
+                Some(path) => path,
+                None => anyhow::bail!("в архиве нет файла {name}"),
+            }
+        } else {
+            let Some(id) = target.tralbum_id else {
+                anyhow::bail!("некорректный локатор Bandcamp");
+            };
+            let zip_path = archive_zip_path(&self.cache_root, id);
+            if zip_path.is_file() {
+                zip_path
+            } else {
+                self.write_archive(&target.request_url, id).await?
+            }
+        };
+
+        if let Some(parent) = dest.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("создание каталога {}", parent.display()))?;
+        }
+        tokio::fs::copy(&source_file, dest).await.with_context(|| {
+            format!("копирование {} в {}", source_file.display(), dest.display())
+        })?;
+        let size = std::fs::metadata(dest).map(|meta| meta.len()).unwrap_or(0);
+        sink.on_finished(size);
+        Ok(())
+    }
+}
+
+/// The default cache root: `$XDG_CACHE_HOME/maxfetch`, then `~/.cache/maxfetch`.
+fn cache_root_default() -> PathBuf {
+    if let Some(base) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(base).join("maxfetch");
+    }
+    if let Some(home) = dirs::home_dir() {
+        return home.join(".cache").join("maxfetch");
+    }
+    std::env::temp_dir().join("maxfetch")
 }
