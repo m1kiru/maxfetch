@@ -8,6 +8,7 @@
 //! into a list of ready-to-use ids.
 
 pub mod soulseek;
+pub mod spotify;
 pub mod youtube;
 
 use std::path::Path;
