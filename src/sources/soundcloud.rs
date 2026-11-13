@@ -13,9 +13,11 @@ use std::sync::OnceLock;
 
 use anyhow::Context;
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::{Credentials, SoundCloudCredentials};
+use crate::model::{Container, Quality, Release, SourceId};
 
 /// The one `client_id` pattern shared by the scraper and its documentation.
 pub const CLIENT_ID_REGEX: &str = r#"client_id\s*:\s*"([0-9a-zA-Z]{32})""#;
@@ -258,4 +260,293 @@ pub async fn get_user(
         .await
         .with_context(|| format!("не удалось прочитать тело профиля {url}"))?;
     parse_user(&body)
+}
+
+// ─── Track catalog (§8.9, `GET /tracks/{id}`) ────────────────────────────────
+//
+// Pure parsing and classification only: fetching the body is Task 8. Extra
+// body fields are ignored on purpose, mirroring `parse_user`.
+
+/// One `media.transcodings[]` entry: a stream variant the API offers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Transcoding {
+    pub preset: String,
+    pub protocol: String,
+    pub mime_type: String,
+}
+
+/// The `GET /tracks/{id}` body reduced to the fields this build reads.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SoundCloudTrack {
+    pub id: u64,
+    pub title: String,
+    pub duration_ms: u64,
+    pub created_at: String,
+    pub genre: Option<String>,
+    pub license: Option<String>,
+    pub permalink_url: String,
+    pub isrc: Option<String>,
+    pub publisher_artist: Option<String>,
+    pub label_name: Option<String>,
+    pub user_id: u64,
+    pub username: String,
+    pub user_permalink: String,
+    pub downloadable: bool,
+    pub has_downloads_left: bool,
+    pub transcodings: Vec<Transcoding>,
+}
+
+impl SoundCloudTrack {
+    /// The canonical `Release` converter for SoundCloud tracks: stage 2
+    /// reuses exactly this method and defines no second converter.
+    pub fn release_from_track(&self) -> Release {
+        let artist = match self.publisher_artist.as_deref() {
+            Some(artist) if !artist.is_empty() => artist.to_string(),
+            _ => self.username.clone(),
+        };
+        Release {
+            title: self.title.clone(),
+            artist,
+            album: None,
+            track_no: None,
+            duration_sec: Some(self.duration_ms as f64 / 1000.0),
+            isrc: self.isrc.clone(),
+            year: self.created_at.get(..4).and_then(|s| s.parse::<i32>().ok()),
+            source: SourceId::SoundCloud,
+            source_item_id: self.id.to_string(),
+        }
+    }
+}
+
+/// A required track field by dot path (`user.id`), missing as in `parse_user`.
+fn track_field<'a>(value: &'a Value, path: &str) -> anyhow::Result<&'a Value> {
+    let mut current = value;
+    for segment in path.split('.') {
+        current = current
+            .get(segment)
+            .ok_or_else(|| anyhow::anyhow!("у трека SoundCloud нет поля {path}"))?;
+    }
+    Ok(current)
+}
+
+/// A required `u64` track field by dot path.
+fn track_u64(value: &Value, path: &str) -> anyhow::Result<u64> {
+    track_field(value, path)?
+        .as_u64()
+        .ok_or_else(|| anyhow::anyhow!("у трека SoundCloud нет поля {path}"))
+}
+
+/// A required string track field by dot path.
+fn track_str(value: &Value, path: &str) -> anyhow::Result<String> {
+    track_field(value, path)?
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("у трека SoundCloud нет поля {path}"))
+}
+
+/// `media.transcodings[]` as typed entries: a missing array degrades to an
+/// empty `Vec`, a broken entry to an unknown transcoding (never an error).
+fn track_transcodings(value: &Value) -> Vec<Transcoding> {
+    value
+        .get("media")
+        .and_then(|media| media.get("transcodings"))
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| Transcoding {
+                    preset: item
+                        .get("preset")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    protocol: item
+                        .get("protocol")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    mime_type: item
+                        .get("mime_type")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parses one SoundCloud track JSON body (`GET /tracks/{id}`).
+pub fn parse_track(json: &str) -> anyhow::Result<SoundCloudTrack> {
+    let value: Value = serde_json::from_str(json)?;
+
+    let id = track_u64(&value, "id")?;
+    let title = track_str(&value, "title")?;
+    let duration_ms = track_u64(&value, "duration")?;
+    let created_at = track_str(&value, "created_at")?;
+    let permalink_url = track_str(&value, "permalink_url")?;
+
+    let publisher_metadata = value.get("publisher_metadata");
+    let isrc = publisher_metadata
+        .and_then(|metadata| metadata.get("isrc"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let publisher_artist = publisher_metadata
+        .and_then(|metadata| metadata.get("artist"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    Ok(SoundCloudTrack {
+        id,
+        title,
+        duration_ms,
+        created_at,
+        genre: value
+            .get("genre")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        license: value
+            .get("license")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        permalink_url,
+        isrc,
+        publisher_artist,
+        label_name: value
+            .get("label_name")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        user_id: track_u64(&value, "user.id")?,
+        username: track_str(&value, "user.username")?,
+        user_permalink: track_str(&value, "user.permalink")?,
+        downloadable: value
+            .get("downloadable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        has_downloads_left: value
+            .get("has_downloads_left")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        transcodings: track_transcodings(&value),
+    })
+}
+
+/// The locator field that distinguishes the lossless original from the
+/// lossy AAC transcodes sharing one `track_id`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SoundCloudFormat {
+    Original,
+    Aac160,
+    Aac96,
+    M3u8,
+}
+
+/// One downloadable audio stream of a track, classified.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AudioFormat {
+    LossyAac { bitrate_kbps: u32 },
+    ProgressiveOriginal { protocol: String },
+}
+
+impl AudioFormat {
+    /// Classifies one transcoding entry; `None` for unknown presets or
+    /// protocols.
+    pub fn from_transcoding(t: &Transcoding) -> Option<AudioFormat> {
+        match (t.preset.as_str(), t.protocol.as_str()) {
+            ("aac_160k", "hls") => Some(AudioFormat::LossyAac { bitrate_kbps: 160 }),
+            ("aac_96k", "hls") => Some(AudioFormat::LossyAac { bitrate_kbps: 96 }),
+            (_, "http_mp3" | "http_opus" | "http_aac" | "progressive") => {
+                Some(AudioFormat::ProgressiveOriginal {
+                    protocol: t.protocol.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Picks the best stream: the first progressive original, if any,
+    /// otherwise the highest-bitrate lossy AAC. Empty input yields `None`.
+    pub fn pick(transcodings: &[Transcoding]) -> Option<AudioFormat> {
+        let classified: Vec<AudioFormat> = transcodings
+            .iter()
+            .filter_map(AudioFormat::from_transcoding)
+            .collect();
+        if let Some(original) = classified
+            .iter()
+            .find(|format| matches!(format, AudioFormat::ProgressiveOriginal { .. }))
+        {
+            return Some(original.clone());
+        }
+        classified
+            .into_iter()
+            .filter_map(|format| match format {
+                AudioFormat::LossyAac { bitrate_kbps } => Some((bitrate_kbps, format)),
+                AudioFormat::ProgressiveOriginal { .. } => None,
+            })
+            .max_by_key(|(bitrate_kbps, _)| *bitrate_kbps)
+            .map(|(_, format)| format)
+    }
+
+    /// The `Quality` this stream offers.
+    ///
+    /// For a progressive original the container is preliminary: the pipeline
+    /// replaces it with the probed quality before anything is written, and
+    /// Task 9 asserts the scanned (not this preliminary) container in the DB.
+    pub fn quality(&self) -> Quality {
+        match self {
+            AudioFormat::LossyAac { bitrate_kbps } => Quality {
+                lossless: false,
+                container: Container::M4aAac,
+                bit_depth: None,
+                sample_rate: None,
+                bitrate_kbps: Some(*bitrate_kbps),
+            },
+            AudioFormat::ProgressiveOriginal { protocol } => match protocol.as_str() {
+                "http_mp3" => original_quality(Container::Mp3),
+                "http_opus" => original_quality(Container::Opus),
+                "http_aac" => original_quality(Container::M4aAac),
+                "progressive" => original_quality(Container::Flac),
+                // Unreachable from `from_transcoding`; kept total because the
+                // protocol is an open `String`. A neutral fallback, not a panic.
+                _ => Quality::default(),
+            },
+        }
+    }
+}
+
+/// A lossless-original `Quality` with everything unprobed left empty.
+fn original_quality(container: Container) -> Quality {
+    Quality {
+        lossless: true,
+        container,
+        bit_depth: None,
+        sample_rate: None,
+        bitrate_kbps: None,
+    }
+}
+
+/// The `yt-dlp -f` format name for a classified stream (consumed by Task 8).
+pub fn ytdlp_format(format: &AudioFormat) -> &'static str {
+    match format {
+        AudioFormat::LossyAac { bitrate_kbps: 160 } => "hls_aac_160k",
+        AudioFormat::LossyAac { bitrate_kbps: 96 } => "hls_aac_96k",
+        // Only 160/96 arise from `from_transcoding`; kept total because the
+        // bitrate is an open `u32`.
+        AudioFormat::LossyAac { .. } => "hls_aac_96k",
+        AudioFormat::ProgressiveOriginal { .. } => "bestaudio",
+    }
+}
+
+/// The locator `format` field naming the picked stream. `M3u8` is not
+/// produced here: it is the stage 2 slot for an HLS playlist that is neither
+/// 160k nor 96k.
+pub fn format_of(audio_format: &AudioFormat) -> SoundCloudFormat {
+    match audio_format {
+        AudioFormat::LossyAac { bitrate_kbps: 160 } => SoundCloudFormat::Aac160,
+        AudioFormat::LossyAac { bitrate_kbps: 96 } => SoundCloudFormat::Aac96,
+        // Only 160/96 arise from `from_transcoding`; kept total because the
+        // bitrate is an open `u32`.
+        AudioFormat::LossyAac { .. } => SoundCloudFormat::Aac96,
+        AudioFormat::ProgressiveOriginal { .. } => SoundCloudFormat::Original,
+    }
 }

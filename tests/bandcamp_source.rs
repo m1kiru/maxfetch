@@ -174,9 +174,9 @@ fn the_tralbum_id_is_recovered_from_the_retry_url_query() {
 
 #[test]
 fn a_foreign_locator_is_rejected() {
-    // WD2: `Locator::SoundCloud` has no `format` field at this HEAD.
     let loc = maxfetch::model::Locator::SoundCloud {
         track_id: "1".into(),
+        format: maxfetch::sources::soundcloud::SoundCloudFormat::Aac160,
     };
     assert!(parse_locator(&loc).is_none());
 }

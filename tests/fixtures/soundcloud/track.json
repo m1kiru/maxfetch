@@ -1,0 +1,10 @@
+{"id":880017,"title":"Neon","duration":214000,"created_at":"2023-05-11T09:14:02Z",
+ "genre":"Electronic","license":"all-rights-reserved",
+ "permalink_url":"https://soundcloud.com/nightwave/neon","artwork_url":"https://i1.sndcdn.com/artworks-neon-large.jpg",
+ "publisher_metadata":{"isrc":"DEP960300042","artist":"Nightwave","publisher":"Nightwave Music","writer_composer":"N. Wave"},
+ "label_name":"Nightwave","downloadable":true,"has_downloads_left":true,
+ "user":{"id":77,"username":"nightwave","permalink":"nightwave"},
+ "media":{"transcodings":[
+   {"preset":"aac_160k","protocol":"hls","mime_type":"audio/mp4; codecs=\"mp4a.40.2\""},
+   {"preset":"aac_96k","protocol":"hls","mime_type":"audio/mp4; codecs=\"mp4a.40.2\""}
+ ]}}

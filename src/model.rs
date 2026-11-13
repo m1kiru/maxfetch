@@ -1,3 +1,4 @@
+use crate::sources::soundcloud::SoundCloudFormat;
 use serde::{Deserialize, Serialize};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -133,14 +134,35 @@ pub enum Locator {
         filename: String,
         size: u64,
     },
-    Bandcamp { url: String, encoding: String },
-    Youtube { url: String, video_id: String },
-    Spotify { track_id: String },
-    SoundCloud { track_id: String },
-    Qobuz { track_id: String, format_id: u32 },
-    Tidal { track_id: String, quality: u8 },
-    Deezer { track_id: String },
-    Beatport { track_id: String },
+    Bandcamp {
+        url: String,
+        encoding: String,
+    },
+    Youtube {
+        url: String,
+        video_id: String,
+    },
+    Spotify {
+        track_id: String,
+    },
+    SoundCloud {
+        track_id: String,
+        format: SoundCloudFormat,
+    },
+    Qobuz {
+        track_id: String,
+        format_id: u32,
+    },
+    Tidal {
+        track_id: String,
+        quality: u8,
+    },
+    Deezer {
+        track_id: String,
+    },
+    Beatport {
+        track_id: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
