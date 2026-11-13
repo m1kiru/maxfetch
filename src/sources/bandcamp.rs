@@ -1,8 +1,13 @@
-//! Bandcamp URL classification and tralbum id extraction.
+//! Bandcamp URL classification, tralbum metadata and promo archives.
 //!
-//! Everything here is pure computation: no HTTP, no I/O. Recorded pages are
-//! replayed by the test harness instead of being fetched.
+//! There is no HTTP here: recorded pages are replayed by the test harness
+//! instead of being fetched, and the download chain is a pure URL/metadata
+//! computation. The filesystem is touched only by the archive layer
+//! ([`is_zip`], [`unpack_archive`], [`unpack_cached`]) and its private listing.
 
+use std::fs::File;
+use std::io::{Read, copy};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::anyhow;
@@ -557,4 +562,194 @@ pub fn format_quality(fmt: &str) -> Option<Quality> {
         sample_rate: None,
         bitrate_kbps,
     })
+}
+
+/// One file extracted from a Bandcamp promo archive.
+///
+/// `member` is the member name inside the ZIP, `path` is where the file was
+/// written under the destination directory.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArchiveEntry {
+    pub member: String,
+    pub path: PathBuf,
+}
+
+/// Whether the file at `path` starts with the ZIP local-file signature.
+///
+/// A file shorter than four bytes is not an archive; an unreadable file is an
+/// error.
+pub fn is_zip(path: &Path) -> anyhow::Result<bool> {
+    let mut file = File::open(path)?;
+    let mut head = [0u8; 4];
+    let n = file.read(&mut head)?;
+    Ok(n == 4 && head == *b"PK\x03\x04")
+}
+
+/// Extracts every file entry of the ZIP at `zip_path` under `dest`.
+///
+/// Directory entries, `__MACOSX/` prefixes and `.DS_Store` are skipped. Each
+/// member name is joined into `dest` through [`crate::library::sanitize_component`]
+/// per path segment, which also drops `.`/`..` segments. The result is sorted by
+/// member name.
+pub fn unpack_archive(zip_path: &Path, dest: &Path) -> anyhow::Result<Vec<ArchiveEntry>> {
+    std::fs::create_dir_all(dest)?;
+    let mut archive = zip::ZipArchive::new(File::open(zip_path)?)?;
+
+    let mut entries = Vec::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        if entry.is_dir() {
+            continue;
+        }
+        let member = entry.name()?.into_owned();
+        if member.starts_with("__MACOSX/") || member == ".DS_Store" {
+            continue;
+        }
+        let relative: PathBuf = member
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .map(crate::library::sanitize_component)
+            .collect();
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let path = dest.join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out = File::create(&path)?;
+        copy(&mut entry, &mut out)?;
+        entries.push(ArchiveEntry { member, path });
+    }
+
+    entries.sort_by(|a, b| a.member.cmp(&b.member));
+    Ok(entries)
+}
+
+/// `<cache_root>/bandcamp/<tralbum_id>`, the single key of the unpacked-archive cache.
+///
+/// Creates nothing; the caller creates the directories it writes to.
+pub fn archive_dir(cache_root: &Path, tralbum_id: u64) -> PathBuf {
+    cache_root.join("bandcamp").join(tralbum_id.to_string())
+}
+
+/// Where the downloaded promo archive is stored for a tralbum.
+pub fn archive_zip_path(cache_root: &Path, tralbum_id: u64) -> PathBuf {
+    archive_dir(cache_root, tralbum_id).join("promo.zip")
+}
+
+/// Where the unpacked members of a tralbum live.
+pub fn archive_members_dir(cache_root: &Path, tralbum_id: u64) -> PathBuf {
+    archive_dir(cache_root, tralbum_id).join("members")
+}
+
+/// Unpacks `zip_path` into the members directory of `tralbum_id`, or lists it.
+///
+/// When the members directory already holds files the ZIP is not opened again;
+/// the archive is read once per tralbum per run.
+pub fn unpack_cached(
+    zip_path: &Path,
+    cache_root: &Path,
+    tralbum_id: u64,
+) -> anyhow::Result<Vec<ArchiveEntry>> {
+    let members_dir = archive_members_dir(cache_root, tralbum_id);
+    if members_dir.is_dir() {
+        let listing = list_members(&members_dir)?;
+        if !listing.is_empty() {
+            return Ok(listing);
+        }
+    }
+    unpack_archive(zip_path, &members_dir)
+}
+
+/// Lists `dir` one level deep, sorted by member name; a missing dir is empty.
+fn list_members(dir: &Path) -> anyhow::Result<Vec<ArchiveEntry>> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            continue;
+        }
+        entries.push(ArchiveEntry {
+            member: entry.file_name().to_string_lossy().into_owned(),
+            path: entry.path(),
+        });
+    }
+    entries.sort_by(|a, b| a.member.cmp(&b.member));
+    Ok(entries)
+}
+
+/// Pairs archive members with tracks, title-stem matches first, then position.
+///
+/// Pass one pairs a member whose normalized stem contains the normalized track
+/// title with a still-unmatched track; pass two pairs the remaining members and
+/// tracks in order. The result keeps the order of `members`; unmatched members
+/// and unmatched tracks are dropped.
+pub fn match_members_to_tracks(
+    members: &[ArchiveEntry],
+    tracks: &[BandcampTrack],
+) -> Vec<(ArchiveEntry, BandcampTrack)> {
+    let stem_norms: Vec<String> = members
+        .iter()
+        .map(|entry| {
+            let stem = Path::new(&entry.member)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let title = stem
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .trim_start();
+            crate::matching::norm(title)
+        })
+        .collect();
+    let title_norms: Vec<String> = tracks
+        .iter()
+        .map(|track| crate::matching::norm(&track.title))
+        .collect();
+
+    let mut matches: Vec<Option<(ArchiveEntry, BandcampTrack)>> =
+        members.iter().map(|_| None).collect();
+    let mut taken = vec![false; tracks.len()];
+
+    for (member_index, stem_norm) in stem_norms.iter().enumerate() {
+        if stem_norm.is_empty() {
+            continue;
+        }
+        let Some(track_index) = title_norms
+            .iter()
+            .enumerate()
+            .find(|(index, title_norm)| {
+                !taken[*index] && !title_norm.is_empty() && stem_norm.contains(*title_norm)
+            })
+            .map(|(index, _)| index)
+        else {
+            continue;
+        };
+        taken[track_index] = true;
+        matches[member_index] = Some((members[member_index].clone(), tracks[track_index].clone()));
+    }
+
+    let leftover_members: Vec<usize> = (0..members.len())
+        .filter(|index| matches[*index].is_none())
+        .collect();
+    let leftover_tracks: Vec<usize> = (0..tracks.len()).filter(|index| !taken[*index]).collect();
+
+    for (member_index, track_index) in leftover_members.iter().zip(leftover_tracks.iter()) {
+        matches[*member_index] =
+            Some((members[*member_index].clone(), tracks[*track_index].clone()));
+    }
+
+    matches.into_iter().flatten().collect()
+}
+
+/// The leading track number of a member stem, if any.
+///
+/// `"01 Neon"` is `Some(1)`, `"12 Dawn"` is `Some(12)`, `"Neon"` is `None`.
+pub fn track_number_from_stem(stem: &str) -> Option<u32> {
+    let digits: String = stem.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
 }
