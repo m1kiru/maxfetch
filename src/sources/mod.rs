@@ -9,6 +9,7 @@
 
 pub mod bandcamp;
 pub mod soulseek;
+pub mod soundcloud;
 pub mod spotify;
 pub mod youtube;
 
