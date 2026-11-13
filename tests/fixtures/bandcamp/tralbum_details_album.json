@@ -1,0 +1,7 @@
+{"id":2814,"title":"Night Drive","tralbum_artist":"Nightwave","release_date":1609459200,
+ "free_download":true,"is_purchasable":true,"price":7.0,"currency":"USD","has_digital_download":true,
+ "tracks":[
+  {"track_id":9001,"title":"Neon","track_num":1,"duration":214.5,"band_name":"Nightwave","album_title":"Night Drive","is_streamable":true,"track_url":"https://nightwave.bandcamp.com/track/neon","streaming_url":"https://t4.bcbits.com/stream/neon/mp3-128/1"},
+  {"track_id":9002,"title":"Midnight","track_num":2,"duration":198.0,"band_name":"Nightwave","album_title":"Night Drive","is_streamable":true,"track_url":"https://nightwave.bandcamp.com/track/midnight","streaming_url":"https://t4.bcbits.com/stream/midnight/mp3-128/1"},
+  {"track_id":9003,"title":"Dawn","track_num":3,"duration":241.25,"band_name":"Nightwave","album_title":"Night Drive","is_streamable":true,"track_url":"https://nightwave.bandcamp.com/track/dawn","streaming_url":"https://t4.bcbits.com/stream/dawn/mp3-128/1"}
+ ]}

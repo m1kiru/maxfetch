@@ -240,3 +240,36 @@ pub fn write_zip(path: &Path, members: &[(&str, &[u8])]) -> anyhow::Result<()> {
     writer.finish()?;
     Ok(())
 }
+
+/// Builds a valid tralbum_details payload with `track_count` streamable tracks.
+///
+/// Track numbers are one-based: `track_num` is the position inside the archive,
+/// so a helper starting at zero would hide an off-by-one between the tralbum
+/// metadata and the archive members.
+pub fn tralbum_json(track_count: u32) -> String {
+    let tracks: Vec<serde_json::Value> = (0..track_count)
+        .map(|i| {
+            serde_json::json!({
+                "track_id": 9001 + i,
+                "title": format!("Track {}", i + 1),
+                "track_num": i + 1,
+                "duration": 200.0 + (i + 1) as f64,
+                "band_name": "Nightwave",
+                "album_title": "Night Drive",
+                "is_streamable": true,
+                "track_url": format!("https://nightwave.bandcamp.com/track/track-{}", i + 1),
+                "streaming_url": "https://t4.bcbits.com/stream/x/mp3-128/1",
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "id": 2814,
+        "title": "Night Drive",
+        "tralbum_artist": "Nightwave",
+        "release_date": 1609459200,
+        "free_download": true,
+        "tracks": tracks,
+    })
+    .to_string()
+}
