@@ -2,16 +2,23 @@
 //!
 //! The pure mappers take the JSON that the Spotify Web API returns, so they are
 //! testable without a network. `SpotifyApi` is the one seam the real client and
-//! the unconfigured stub share; `impl Source` arrives with Task 6.
+//! the unconfigured stub share. [`SpotifySource`] is catalogue-only: it lists no
+//! candidates, refuses to download, and turns a playlist request away before any
+//! call, because playlists need user auth that stage 2 brings.
 
 use std::future::Future;
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::anyhow;
+use async_trait::async_trait;
 use rspotify::clients::BaseClient as _;
 use rspotify::model::{AlbumId, PlaylistId, SearchType, TrackId};
 
-use crate::model::{Release, SourceId};
+use crate::fetch::ProgressSink;
+use crate::matching::match_key;
+use crate::model::{Candidate, Release, SourceId};
+use crate::sources::{AuthState, Capabilities, Query, QueryItem, Source};
 
 /// The one seam between the source and Spotify: one object-safe trait, two
 /// implementations.
@@ -138,10 +145,8 @@ impl SpotifyApi for UnconfiguredApi {
     }
 }
 
-/// Holds what Task 6's `impl Source` will read.
+/// Spotify as a metadata-only catalogue; see [`Source`] for its behaviour.
 #[derive(Clone, Debug)]
-// read by `impl Source` in Task 6
-#[allow(dead_code)]
 pub struct SpotifySource {
     api: Arc<dyn SpotifyApi>,
     client_id: String,
@@ -159,6 +164,138 @@ impl SpotifySource {
             client_id,
             client_secret,
         }
+    }
+
+    /// Maps the JSON records that carry an id, dropping the rest with a log.
+    fn releases_from(records: &[serde_json::Value]) -> Vec<Release> {
+        records
+            .iter()
+            .filter_map(|record| {
+                let Some(id) = record["id"].as_str() else {
+                    tracing::warn!("spotify: dropping a record without an id");
+                    return None;
+                };
+                match release_from_track(record, id) {
+                    Ok(release) => Some(release),
+                    Err(error) => {
+                        tracing::warn!(id = %id, error = %error, "spotify: dropping an unmappable record");
+                        None
+                    }
+                }
+            })
+            .collect()
+    }
+}
+
+/// The one wording for "Spotify playlists need user auth, which stage 2 brings".
+pub fn playlist_requires_auth_message() -> &'static str {
+    "нужна авторизация Spotify, она появится на этапе 2"
+}
+
+/// Lets a Spotify description override a worse description of the same release.
+///
+/// Adoption needs equal ISRCs, or no ISRC on either side plus an equal
+/// [`match_key`]. The return value reports that the condition held, not that
+/// bytes changed.
+pub fn adopt_reference(target: &mut Release, reference: &Release) -> bool {
+    let accepted = match (&target.isrc, &reference.isrc) {
+        (Some(left), Some(right)) => left == right,
+        (None, None) => match_key(target) == match_key(reference),
+        _ => false,
+    };
+    if !accepted {
+        return false;
+    }
+    target.title = reference.title.clone();
+    target.artist = reference.artist.clone();
+    target.album = reference.album.clone();
+    target.isrc = reference.isrc.clone();
+    true
+}
+
+#[async_trait]
+impl Source for SpotifySource {
+    fn id(&self) -> SourceId {
+        SourceId::Spotify
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            audio: false,
+            metadata_only: true,
+            lossless: false,
+            needs_auth: true,
+        }
+    }
+
+    fn auth_state(&self) -> AuthState {
+        if self.client_id.is_empty() || self.client_secret.is_empty() {
+            AuthState::Missing
+        } else {
+            AuthState::Ok
+        }
+    }
+
+    async fn search(&self, q: &Query) -> anyhow::Result<Vec<Release>> {
+        let query = q
+            .text
+            .as_deref()
+            .or(q.url.as_deref())
+            .unwrap_or_default()
+            .trim();
+        if query.is_empty() {
+            anyhow::bail!("пустой поисковый запрос");
+        }
+        let hits = self.api.search_tracks(query)?;
+        Ok(Self::releases_from(&hits))
+    }
+
+    async fn resolve(&self, q: &Query) -> anyhow::Result<Vec<Release>> {
+        // Refused before the API is touched: playlists need user auth.
+        for item in &q.items {
+            if let QueryItem::Playlist {
+                source: SourceId::Spotify,
+                ..
+            } = item
+            {
+                return Err(anyhow!("{}", playlist_requires_auth_message()));
+            }
+        }
+
+        let mut releases = Vec::new();
+        for item in &q.items {
+            match item {
+                QueryItem::Track {
+                    source: SourceId::Spotify,
+                    id,
+                } => {
+                    let track = self.api.track(id)?;
+                    releases.push(release_from_track(&track, id)?);
+                }
+                QueryItem::Album {
+                    source: SourceId::Spotify,
+                    id,
+                } => {
+                    let tracks = self.api.album(id)?;
+                    releases.extend(Self::releases_from(&tracks));
+                }
+                _ => {}
+            }
+        }
+        Ok(releases)
+    }
+
+    async fn candidates(&self, _release: &Release) -> anyhow::Result<Vec<Candidate>> {
+        Ok(Vec::new())
+    }
+
+    async fn download(
+        &self,
+        _candidate: &Candidate,
+        _dest: &Path,
+        _sink: &dyn ProgressSink,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("Spotify не отдаёт аудио: источник только для метаданных")
     }
 }
 
