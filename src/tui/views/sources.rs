@@ -23,39 +23,33 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let items: Vec<ListItem> = app.status.iter().map(item).collect();
+    let rows = app.source_rows();
+    let items: Vec<ListItem> = app
+        .status
+        .iter()
+        .zip(rows)
+        .map(|(status, row)| item(status, row))
+        .collect();
     frame.render_widget(List::new(items), inner);
 }
 
-fn item(status: &SourceStatus) -> ListItem<'static> {
-    let headline = format!("{} — {}", status.id.as_str(), auth_label(status.auth));
+fn item(status: &SourceStatus, headline: String) -> ListItem<'static> {
     let headline = if emphasises_auth(status) {
         Line::styled(headline, Style::new().add_modifier(Modifier::REVERSED))
     } else {
         Line::from(headline)
     };
-    let detail = status
-        .detail
-        .clone()
-        .unwrap_or_else(|| "подробностей нет".to_string());
     let capabilities = capabilities_label(status);
-    let detail = if capabilities.is_empty() {
-        detail
-    } else {
-        format!("{detail} · {capabilities}")
+    let detail = match (status.detail.as_deref(), capabilities.is_empty()) {
+        (Some(detail), false) => format!("{detail} · {capabilities}"),
+        (Some(detail), true) => detail.to_string(),
+        (None, false) => capabilities,
+        (None, true) => "подробностей нет".to_string(),
     };
     ListItem::new(vec![
         headline,
         Line::styled(format!("    {detail}"), hint_style()),
     ])
-}
-
-fn auth_label(auth: AuthState) -> &'static str {
-    match auth {
-        AuthState::NotNeeded | AuthState::Ok => "доступен",
-        AuthState::Missing => "нет авторизации",
-        AuthState::Expired => "ключ протух",
-    }
 }
 
 /// Missing credentials of a source that cannot work without them deserve the

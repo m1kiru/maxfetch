@@ -96,6 +96,22 @@ pub fn auth_status(credentials: &Credentials) -> Vec<SourceStatus> {
         .collect()
 }
 
+/// One Russian line for a source: id, auth state and the detail when present.
+///
+/// The wording matches the Sources screen, so the CLI and the TUI show the same
+/// string for the same source.
+pub fn describe_status(status: &SourceStatus) -> String {
+    let state = match status.auth {
+        AuthState::Ok | AuthState::NotNeeded => "доступен",
+        AuthState::Missing => "нет авторизации",
+        AuthState::Expired => "ключ протух",
+    };
+    match status.detail.as_deref() {
+        Some(detail) => format!("{}: {state} — {detail}", status.id.as_str()),
+        None => format!("{}: {state}", status.id.as_str()),
+    }
+}
+
 /// Maps the credential section of `id` onto an [`AuthState`].
 ///
 /// Presence only: an empty section counts as configured, because validating

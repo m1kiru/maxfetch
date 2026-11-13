@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use maxfetch::config::Config;
 use maxfetch::db::Db;
 use maxfetch::fetch::{NoopSink, ProgressSink};
+use maxfetch::matching::ReleaseGroup;
 use maxfetch::model::{Candidate, Container, Locator, Quality, Release, SourceId};
 use maxfetch::pipeline::{DownloadResult, Pipeline};
 use maxfetch::sources::{AuthState, Capabilities, Query, Source};
@@ -22,8 +23,8 @@ fn flac_bytes(name: &str) -> Vec<u8> {
 }
 
 /// Configuration for the tests: every source id used by the fakes must be
-/// listed explicitly, because `sources::enabled_in` is a pure filter — an empty
-/// or unrelated list would silently leave the fakes out of the pipeline.
+/// listed explicitly, because `sources::enabled_in` is a pure filter — a list
+/// without the needed id would silently leave the fakes out of the pipeline.
 fn cfg_in(dir: &Path) -> Config {
     let mut cfg = Config::default();
     cfg.library.path = dir.join("library");
@@ -245,6 +246,72 @@ impl Source for Unauthorized {
         sink: &dyn ProgressSink,
     ) -> anyhow::Result<()> {
         self.inner.download(candidate, dest, sink).await
+    }
+}
+
+/// A YouTube fake: writes the media bytes and the JSON sidecar next to them,
+/// the way [`maxfetch::youtube::finalize`] does when the remux fails.
+struct SidecarFake {
+    bytes: Vec<u8>,
+}
+
+#[async_trait]
+impl Source for SidecarFake {
+    fn id(&self) -> SourceId {
+        SourceId::Youtube
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            audio: true,
+            metadata_only: false,
+            lossless: false,
+            needs_auth: false,
+        }
+    }
+
+    fn auth_state(&self) -> AuthState {
+        AuthState::NotNeeded
+    }
+
+    async fn search(&self, _q: &Query) -> anyhow::Result<Vec<Release>> {
+        Ok(Vec::new())
+    }
+
+    async fn resolve(&self, _q: &Query) -> anyhow::Result<Vec<Release>> {
+        Ok(Vec::new())
+    }
+
+    async fn candidates(&self, release: &Release) -> anyhow::Result<Vec<Candidate>> {
+        Ok(vec![Candidate {
+            source: SourceId::Youtube,
+            release: release.clone(),
+            quality: Quality {
+                lossless: false,
+                container: Container::Opus,
+                bit_depth: None,
+                sample_rate: Some(48_000),
+                bitrate_kbps: Some(160),
+            },
+            size_bytes: Some(self.bytes.len() as u64),
+            locator: Locator::Youtube {
+                url: "https://www.youtube.com/watch?v=abc123".to_string(),
+                video_id: "abc123".to_string(),
+            },
+        }])
+    }
+
+    async fn download(
+        &self,
+        _candidate: &Candidate,
+        dest: &Path,
+        _sink: &dyn ProgressSink,
+    ) -> anyhow::Result<()> {
+        std::fs::write(dest, &self.bytes)?;
+        let mut sidecar = dest.as_os_str().to_os_string();
+        sidecar.push(".json");
+        std::fs::write(PathBuf::from(sidecar), b"{}")?;
+        Ok(())
     }
 }
 
@@ -574,4 +641,125 @@ async fn download_with(dir: &Path, single: bool) -> DownloadResult {
     } else {
         pipeline.download(&candidates, &NoopSink).await.unwrap()
     }
+}
+
+// A source without credentials never sees the candidate query: `runnable_sources`
+// drops it before `Source::candidates` is called.
+#[tokio::test]
+async fn an_unauthorized_source_is_not_asked_for_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let searches = Arc::new(AtomicUsize::new(0));
+    let unauthorized = Unauthorized {
+        inner: Fake::flac(
+            SourceId::Soulseek,
+            vec![rel(SourceId::Soulseek)],
+            quality(16, 44100),
+            "sine_44100_s16.flac",
+        ),
+        searches: searches.clone(),
+    };
+    let pipeline = Pipeline::new(
+        cfg_in(dir.path()),
+        Db::open_in_memory().unwrap(),
+        vec![Box::new(unauthorized)],
+    );
+    let group = ReleaseGroup {
+        primary: rel(SourceId::Soulseek),
+        members: Vec::new(),
+        sources: vec![SourceId::Soulseek],
+    };
+
+    let candidates = pipeline.candidates(&group).await.unwrap();
+
+    // Before the gate `Unauthorized::candidates` delegates to `Fake` and returns
+    // one candidate, so an empty vector pins the gate itself.
+    assert!(candidates.is_empty());
+}
+
+// A candidate from an unauthorized source is dropped with the Russian reason
+// instead of being downloaded; the library stays empty.
+#[tokio::test]
+async fn a_download_from_an_unauthorized_source_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let searches = Arc::new(AtomicUsize::new(0));
+    let unauthorized = Unauthorized {
+        inner: Fake::flac(
+            SourceId::Soulseek,
+            vec![rel(SourceId::Soulseek)],
+            quality(16, 44100),
+            "sine_44100_s16.flac",
+        ),
+        searches: searches.clone(),
+    };
+    let pipeline = Pipeline::new(
+        cfg_in(dir.path()),
+        Db::open_in_memory().unwrap(),
+        vec![Box::new(unauthorized)],
+    );
+    let candidate = Candidate {
+        source: SourceId::Soulseek,
+        release: rel(SourceId::Soulseek),
+        quality: quality(16, 44100),
+        size_bytes: Some(1),
+        locator: locator(SourceId::Soulseek),
+    };
+
+    let result = pipeline
+        .download(std::slice::from_ref(&candidate), &NoopSink)
+        .await
+        .unwrap();
+
+    assert!(result.rejected);
+    assert!(result.path.as_os_str().is_empty());
+    assert!(result.attempts >= 1);
+    let reason = result.reason.as_deref().unwrap_or_default();
+    assert!(reason.contains("нет авторизации"), "{reason}");
+    // The library holds no regular file: `.tmp` is created but stays empty.
+    assert!(library_files(&dir.path().join("library")).is_empty());
+    assert!(pipeline.db().all_tracks().unwrap().is_empty());
+}
+
+// The sidecar `YoutubeSource::download` leaves next to the temporary file moves
+// into the library together with the media file.
+#[tokio::test]
+async fn a_youtube_sidecar_follows_the_file_into_the_library() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = cfg_in(dir.path());
+    cfg.sources.enabled.push("youtube".into());
+    let fake = SidecarFake {
+        bytes: flac_bytes("sine_44100_s16.flac"),
+    };
+    let pipeline = Pipeline::new(cfg, Db::open_in_memory().unwrap(), vec![Box::new(fake)]);
+    let group = ReleaseGroup {
+        primary: rel(SourceId::Youtube),
+        members: Vec::new(),
+        sources: vec![SourceId::Youtube],
+    };
+
+    let candidates = pipeline.candidates(&group).await.unwrap();
+    assert_eq!(candidates.len(), 1);
+    let result = pipeline.download(&candidates, &NoopSink).await.unwrap();
+
+    assert!(!result.rejected);
+    assert!(result.path.exists());
+    let sidecar = PathBuf::from(format!("{}.json", result.path.display()));
+    assert!(sidecar.exists(), "{}", sidecar.display());
+    assert_eq!(std::fs::read(&sidecar).unwrap(), b"{}");
+}
+
+/// Every regular file under `root`, recursively; a missing root is empty.
+fn library_files(root: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return found;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(library_files(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found
 }

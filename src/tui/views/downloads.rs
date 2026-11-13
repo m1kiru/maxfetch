@@ -7,6 +7,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Gauge, List, ListItem, ListState, Paragraph};
 
+use crate::sources::soulseek::PeerCandidate;
 use crate::tui::views::{hint_style, human_size, human_speed, render_scrollbar};
 use crate::tui::{App, DownloadItem};
 
@@ -54,6 +55,21 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         state.offset() as u16,
         2,
     );
+}
+
+/// The one line the Downloads screen prints per active transfer.
+///
+/// A peer with no free slots is reported as unusable: the transfer is still
+/// running, but the line says why it makes no progress.
+pub fn transfer_line(peer: &PeerCandidate, title: &str) -> String {
+    if peer.slots == 0 {
+        format!("{title}: пир {} недоступен (0 слотов)", peer.username)
+    } else {
+        format!(
+            "{title}: пир {}, слотов {}, скорость {}",
+            peer.username, peer.slots, peer.speed
+        )
+    }
 }
 
 fn headline(item: &DownloadItem) -> Line<'static> {

@@ -7,8 +7,10 @@
 
 mod views;
 
+pub use views::downloads::transfer_line;
+
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -206,6 +208,37 @@ impl App {
             editing: false,
             dirty: false,
             help: false,
+        }
+    }
+
+    /// One `auth::describe_status` line per entry of `self.status`.
+    pub fn source_rows(&self) -> Vec<String> {
+        self.status
+            .iter()
+            .map(crate::auth::describe_status)
+            .collect()
+    }
+
+    /// `UNTAGGED` for a delivered YouTube file that kept its sidecar, `LOSSY`
+    /// for another lossy candidate, `None` for a lossless one.
+    ///
+    /// The final path of a download is only known to the caller that performed
+    /// it, so `downloaded` is `None` wherever the badge is drawn from the
+    /// candidate alone.
+    pub fn candidate_badge(
+        &self,
+        candidate: &Candidate,
+        downloaded: Option<&Path>,
+    ) -> Option<&'static str> {
+        if let Some(path) = downloaded
+            && crate::youtube::untagged(path)
+        {
+            return Some("UNTAGGED");
+        }
+        if !candidate.quality.lossless {
+            Some("LOSSY")
+        } else {
+            None
         }
     }
 

@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::auth::describe_status;
 use crate::config::{self, Config, Credentials};
 use crate::db::{Db, TrackRecord};
 use crate::dedup::{self, DeletionPlan};
@@ -29,7 +30,7 @@ use crate::fetch::ProgressSink;
 use crate::library::absolute_path;
 use crate::model::{Quality, SourceId};
 use crate::pipeline::Pipeline;
-use crate::sources::{self, AuthState, Capabilities, Query};
+use crate::sources::{self, Capabilities, Query};
 
 /// Parsed command line of the `maxfetch` binary.
 #[derive(Debug, Parser)]
@@ -453,7 +454,7 @@ async fn run_with_writers<'w>(
             fetch(&mut session, &library_root, request, dry_run).await
         }
         Command::Library { command } => library(&mut session, &library_root, command, dry_run),
-        Command::Auth { command } => auth(&credentials, command, &mut session),
+        Command::Auth { command } => auth(command, &mut session),
         Command::Sources { command } => {
             let SourcesCommand::Check = command;
             sources_check(&mut session)
@@ -804,12 +805,22 @@ fn write_fetch_summary(
     }
 }
 
+/// The query of a `fetch --playlist <url>` run.
+pub fn playlist_query(url: &str) -> Query {
+    Query {
+        url: Some(url.to_string()),
+        ..Query::default()
+    }
+}
+
 /// Builds the single text/URL query of a `fetch` run.
 fn query_from_request(request: &FetchRequest) -> Result<Query> {
+    if let Some(url) = request.playlist.as_deref() {
+        return Ok(playlist_query(url));
+    }
     let url = request
-        .playlist
+        .spotify_track
         .clone()
-        .or_else(|| request.spotify_track.clone())
         .or_else(|| request.spotify_playlist.clone())
         .or_else(|| request.page.clone())
         .or_else(|| request.soundcloud.clone());
@@ -926,11 +937,7 @@ fn confirm_deletion(out: &mut dyn Write) -> Result<bool> {
     Ok(matches!(answer.as_str(), "y" | "yes" | "д" | "да"))
 }
 
-fn auth(
-    credentials: &Credentials,
-    command: AuthCommand,
-    session: &mut Session<'_, '_>,
-) -> Result<()> {
+fn auth(command: AuthCommand, session: &mut Session<'_, '_>) -> Result<()> {
     match command {
         AuthCommand::Login { source } => {
             session.human(&format!(
@@ -939,30 +946,14 @@ fn auth(
             Ok(())
         }
         AuthCommand::Status => {
-            for (name, configured) in credential_sections(credentials) {
-                let state = if configured {
-                    "настроено"
-                } else {
-                    "не настроено"
-                };
-                session.human(&format!("{name}: {state}"))?;
+            let statuses = session.pipeline.source_statuses();
+            for status in &statuses {
+                session.human(&describe_status(status))?;
             }
+            session.human("вход для soulseek, youtube и spotify появится в следующем этапе")?;
             Ok(())
         }
     }
-}
-
-fn credential_sections(credentials: &Credentials) -> Vec<(&'static str, bool)> {
-    vec![
-        ("soulseek", credentials.soulseek.is_some()),
-        ("bandcamp", credentials.bandcamp.is_some()),
-        ("spotify", credentials.spotify.is_some()),
-        ("soundcloud", credentials.soundcloud.is_some()),
-        ("qobuz", credentials.qobuz.is_some()),
-        ("tidal", credentials.tidal.is_some()),
-        ("deezer", credentials.deezer.is_some()),
-        ("beatport", credentials.beatport.is_some()),
-    ]
 }
 
 fn sources_check(session: &mut Session<'_, '_>) -> Result<()> {
@@ -973,11 +964,9 @@ fn sources_check(session: &mut Session<'_, '_>) -> Result<()> {
     }
     for status in &statuses {
         session.human(&format!(
-            "{} — возможности: {}; авторизация: {}; {}",
-            status.id.as_str(),
-            describe_capabilities(&status.capabilities),
-            describe_auth(status.auth),
-            status.detail.as_deref().unwrap_or("подробностей нет")
+            "{} · возможности: {}",
+            describe_status(status),
+            describe_capabilities(&status.capabilities)
         ))?;
     }
     Ok(())
@@ -1069,15 +1058,6 @@ fn describe_capabilities(capabilities: &Capabilities) -> String {
         return "нет".to_string();
     }
     parts.join(", ")
-}
-
-fn describe_auth(auth: AuthState) -> &'static str {
-    match auth {
-        AuthState::NotNeeded => "не требуется",
-        AuthState::Missing => "не настроена",
-        AuthState::Ok => "в порядке",
-        AuthState::Expired => "истекла",
-    }
 }
 
 fn album_suffix(album: Option<&str>) -> String {

@@ -72,28 +72,37 @@ impl Pipeline {
     /// One status per registered source, in registration order.
     ///
     /// Every source is reported — enabled or not — because the UI shows what
-    /// exists next to what is switched on. Per-source detail is not collected
-    /// yet.
+    /// exists next to what is switched on. The Russian diagnosis (a missing
+    /// `yt-dlp`, the credentials section to fill in) comes from the source
+    /// itself, so no second registry is built.
     pub fn source_statuses(&self) -> Vec<SourceStatus> {
-        self.sources
-            .iter()
-            .map(|source| SourceStatus {
-                id: source.id(),
-                capabilities: source.capabilities(),
-                auth: source.auth_state(),
-                detail: None,
-            })
-            .collect()
+        crate::sources::source_statuses(&self.sources)
     }
 
-    /// Sources that survived [`enabled_in`], in registration order.
-    fn enabled_sources(&self) -> Vec<&dyn Source> {
+    /// Sources that are both enabled in the config and able to answer.
+    ///
+    /// A source switched off in `config.sources.enabled` is logged at `debug`
+    /// and never queried; one without credentials is logged at `warn` with the
+    /// Russian reason from [`skip_reason`]. Registration order is preserved.
+    fn runnable_sources(&self) -> Vec<&dyn Source> {
         let ids: Vec<SourceId> = self.sources.iter().map(|source| source.id()).collect();
         let enabled = enabled_in(&ids, &self.config);
         self.sources
             .iter()
-            .filter(|source| enabled.contains(&source.id()))
-            .map(|source| source.as_ref())
+            .filter_map(|source| {
+                let id = source.id();
+                if !enabled.contains(&id) {
+                    tracing::debug!(source = %id.as_str(), "source disabled in the config");
+                    return None;
+                }
+                match skip_reason(source.as_ref()) {
+                    Some(reason) => {
+                        tracing::warn!(%reason, "source skipped");
+                        None
+                    }
+                    None => Some(source.as_ref()),
+                }
+            })
             .collect()
     }
 
@@ -121,17 +130,7 @@ impl Pipeline {
         }
 
         let by_text = text.is_some();
-        let sources: Vec<&dyn Source> = self
-            .enabled_sources()
-            .into_iter()
-            .filter(|source| match skip_reason(*source) {
-                Some(reason) => {
-                    tracing::warn!(%reason, "source skipped");
-                    false
-                }
-                None => true,
-            })
-            .collect();
+        let sources = self.runnable_sources();
         let results = futures_util::future::join_all(sources.iter().map(|source| async move {
             let id = source.id();
             let outcome = if by_text {
@@ -173,12 +172,14 @@ impl Pipeline {
         Ok(groups)
     }
 
-    /// Collects candidates for `group` from every enabled source and ranks them.
+    /// Collects candidates for `group` from every runnable source and ranks them.
     ///
     /// The group's primary release is the one handed to the sources. A source
-    /// that fails is logged and skipped.
+    /// switched off in the config is not queried; one without credentials is
+    /// skipped with the Russian reason from [`skip_reason`]. A source that fails
+    /// is logged and skipped.
     pub async fn candidates(&self, group: &ReleaseGroup) -> anyhow::Result<Vec<Candidate>> {
-        let sources = self.enabled_sources();
+        let sources = self.runnable_sources();
         let primary = &group.primary;
         let results = futures_util::future::join_all(sources.iter().map(|source| async move {
             let id = source.id();
@@ -239,6 +240,17 @@ impl Pipeline {
                         candidate.source.as_str()
                     )
                 })?;
+
+            // A candidate from a source that cannot answer is a soft skip, not a
+            // failure: `attempts` was already counted above, so the gate does not
+            // touch it. It sits before `download` because a source without
+            // credentials may block the runtime while logging in.
+            if let Some(skip) = skip_reason(source.as_ref()) {
+                tracing::warn!(reason = %skip, "candidate skipped");
+                rejected = true;
+                reason = Some(skip);
+                continue;
+            }
 
             // A fresh temporary name per attempt: `fetch::download_to_file` writes
             // to a fixed `.part` sibling, so two attempts sharing a destination
@@ -310,6 +322,22 @@ impl Pipeline {
                 .with_context(|| {
                     format!("moving {} to {}", tmp_path.display(), final_path.display())
                 })?;
+
+            // `YoutubeSource::download` leaves its sidecar next to the temporary
+            // file when the remux failed, so the rename above does not carry it.
+            if candidate.source == SourceId::Youtube {
+                match crate::youtube::move_sidecar(&tmp_path, &final_path) {
+                    Ok(Some(sidecar)) => {
+                        tracing::debug!(sidecar = %sidecar.display(), "relocated the youtube sidecar");
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        // The media file is already in the library; a lost sidecar
+                        // is metadata loss, not a failed download.
+                        tracing::warn!(error = %error, "failed to relocate the youtube sidecar");
+                    }
+                }
+            }
 
             let acquired_at = chrono::Utc::now().to_rfc3339();
             let meta = TagMeta {

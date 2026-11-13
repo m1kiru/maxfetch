@@ -46,8 +46,8 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
         .iter()
         .map(|candidate| {
             let mut badges: Vec<&str> = Vec::new();
-            if !candidate.quality.lossless {
-                badges.push("LOSSY");
+            if let Some(badge) = app.candidate_badge(candidate, None) {
+                badges.push(badge);
             }
             if has_conflict(candidate, &app.candidates) {
                 badges.push("конфликт");
