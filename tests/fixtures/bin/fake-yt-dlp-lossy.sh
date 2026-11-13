@@ -1,5 +1,5 @@
 #!/bin/sh
-# Delivers a real lossy file: an MP3 128 kbps, never a FLAC.
+# Delivers a real lossy file: an MP3 192 kbps, never a FLAC.
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -o) OUT="$2"; shift 2 ;;

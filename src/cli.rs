@@ -383,7 +383,7 @@ pub async fn run_with(
 async fn run_with_writers<'w>(
     cli: Cli,
     mut config: Config,
-    credentials: Credentials,
+    mut credentials: Credentials,
     out: &'w mut dyn Write,
     events: Option<&'w mut dyn Write>,
 ) -> Result<()> {
@@ -454,7 +454,7 @@ async fn run_with_writers<'w>(
             fetch(&mut session, &library_root, request, dry_run).await
         }
         Command::Library { command } => library(&mut session, &library_root, command, dry_run),
-        Command::Auth { command } => auth(command, &mut session),
+        Command::Auth { command } => auth(command, &mut session, &mut credentials).await,
         Command::Sources { command } => {
             let SourcesCommand::Check = command;
             sources_check(&mut session)
@@ -937,12 +937,20 @@ fn confirm_deletion(out: &mut dyn Write) -> Result<bool> {
     Ok(matches!(answer.as_str(), "y" | "yes" | "д" | "да"))
 }
 
-fn auth(command: AuthCommand, session: &mut Session<'_, '_>) -> Result<()> {
+async fn auth(
+    command: AuthCommand,
+    session: &mut Session<'_, '_>,
+    credentials: &mut Credentials,
+) -> Result<()> {
     match command {
         AuthCommand::Login { source } => {
-            session.human(&format!(
-                "источник {source} не поддерживается в этой сборке: авторизация появится позже"
-            ))?;
+            match crate::auth::login(&source, credentials).await {
+                Ok(()) => {
+                    crate::auth::save_credentials(credentials)?;
+                    session.human("вход настроен: учётные данные сохранены")?;
+                }
+                Err(err) => session.human(&format!("{err}"))?,
+            }
             Ok(())
         }
         AuthCommand::Status => {

@@ -6,12 +6,18 @@ use maxfetch::sources::spotify::{RspotifyApi, SpotifySource, UnconfiguredApi};
 use maxfetch::sources::{AuthState, enabled_in, registry, skip_reason, source_statuses};
 
 #[test]
-fn the_registry_holds_the_three_stage_one_sources() {
+fn the_registry_holds_every_implemented_source() {
     let sources = registry(&Config::default(), &Credentials::default());
     let ids: Vec<SourceId> = sources.iter().map(|s| s.id()).collect();
     assert_eq!(
         ids,
-        vec![SourceId::Soulseek, SourceId::Youtube, SourceId::Spotify]
+        vec![
+            SourceId::Soulseek,
+            SourceId::Youtube,
+            SourceId::Spotify,
+            SourceId::Bandcamp,
+            SourceId::SoundCloud
+        ]
     );
 }
 
@@ -20,7 +26,7 @@ fn a_disabled_source_is_still_registered_and_only_filtered_on_use() {
     let mut cfg = Config::default();
     cfg.sources.enabled = vec!["soulseek".into()];
     let sources = registry(&cfg, &Credentials::default());
-    assert_eq!(sources.len(), 3);
+    assert_eq!(sources.len(), 5);
     let ids: Vec<SourceId> = sources.iter().map(|s| s.id()).collect();
     assert_eq!(enabled_in(&ids, &cfg), vec![SourceId::Soulseek]);
     assert_eq!(enabled_in(&[], &cfg), Vec::<SourceId>::new());
@@ -34,7 +40,7 @@ fn a_disabled_source_is_still_registered_and_only_filtered_on_use() {
     // An empty enabled list means "everything enabled", in the input order.
     cfg.sources.enabled = Vec::new();
     assert_eq!(enabled_in(&ids, &cfg), ids);
-    assert_eq!(registry(&cfg, &Credentials::default()).len(), 3);
+    assert_eq!(registry(&cfg, &Credentials::default()).len(), 5);
 }
 
 #[test]

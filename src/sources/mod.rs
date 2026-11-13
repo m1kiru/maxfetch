@@ -22,7 +22,9 @@ use crate::config::{Config, Credentials};
 use crate::fetch::ProgressSink;
 use crate::model::{Candidate, Release, SourceId};
 
+use bandcamp::BandcampSource;
 use soulseek::SoulseekSource;
+use soundcloud::SoundCloudSource;
 use spotify::{RspotifyApi, SpotifyApi, SpotifySource, UnconfiguredApi};
 use youtube::YoutubeSource;
 
@@ -126,11 +128,13 @@ pub trait Source: Send + Sync {
 /// Returns every source compiled into this build.
 ///
 /// The registry never filters by configuration: it answers "what exists",
-/// not "what is enabled". Selection happens in [`enabled_in`]. The order is
-/// fixed — Soulseek, YouTube, Spotify — so the CLI and the TUI render a stable
-/// list. No constructor opens a socket or reads `credentials.toml`.
+/// not "what is enabled". Selection happens in [`enabled_in`], so a
+/// registered but disabled source stays visible and does not participate
+/// in a run. The order is fixed — Soulseek, YouTube, Spotify, Bandcamp,
+/// SoundCloud — so the CLI and the TUI render a stable list. No constructor
+/// opens a socket or reads `credentials.toml`.
 pub fn registry(config: &Config, credentials: &Credentials) -> Vec<Box<dyn Source>> {
-    let mut sources: Vec<Box<dyn Source>> = Vec::with_capacity(3);
+    let mut sources: Vec<Box<dyn Source>> = Vec::with_capacity(5);
 
     sources.push(Box::new(SoulseekSource::new(
         credentials.soulseek.clone().unwrap_or_default(),
@@ -152,6 +156,9 @@ pub fn registry(config: &Config, credentials: &Credentials) -> Vec<Box<dyn Sourc
         None => (String::new(), String::new()),
     };
     sources.push(Box::new(SpotifySource::new(api, client_id, client_secret)));
+
+    sources.push(Box::new(BandcampSource::new(config, credentials)));
+    sources.push(Box::new(SoundCloudSource::new(config, credentials)));
 
     sources
 }
