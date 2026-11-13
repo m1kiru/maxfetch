@@ -311,9 +311,22 @@ impl Source for SpotifySource {
 }
 
 /// Real client over `rspotify` with the `client_credentials` flow.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RspotifyApi {
     client: rspotify::ClientCredsSpotify,
+}
+
+/// Prints the client id but never the secret held inside `rspotify`.
+///
+/// `ClientCredsSpotify` derives `Debug` and prints `Credentials { secret: … }`,
+/// so the derived output would leak the secret through any log line.
+impl std::fmt::Debug for RspotifyApi {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RspotifyApi")
+            .field("client_id", &self.client.creds.id)
+            .field("client_secret", &"***")
+            .finish_non_exhaustive()
+    }
 }
 
 impl RspotifyApi {

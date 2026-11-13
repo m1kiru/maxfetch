@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use maxfetch::config::{Config, Credentials, SoulseekCredentials, SpotifyCredentials};
 use maxfetch::model::SourceId;
-use maxfetch::sources::spotify::{SpotifySource, UnconfiguredApi};
+use maxfetch::sources::spotify::{RspotifyApi, SpotifySource, UnconfiguredApi};
 use maxfetch::sources::{AuthState, enabled_in, registry, skip_reason, source_statuses};
 
 #[test]
@@ -139,12 +139,23 @@ fn unauthorized_sources_get_a_skip_reason() {
 
 #[test]
 fn spotify_debug_masks_the_client_secret() {
-    let source = SpotifySource::new(
+    let unconfigured = SpotifySource::new(
         Arc::new(UnconfiguredApi),
         "client-id".into(),
         "top-secret".into(),
     );
-    let text = format!("{source:?}");
+    let text = format!("{unconfigured:?}");
+    assert!(text.contains("client-id"), "{text}");
+    assert!(!text.contains("top-secret"), "{text}");
+
+    // `RspotifyApi` wraps `rspotify::ClientCredsSpotify`, whose derived `Debug`
+    // prints the secret, so a configured source must stay safe to log too.
+    let configured = SpotifySource::new(
+        Arc::new(RspotifyApi::new("client-id".into(), "top-secret".into())),
+        "client-id".into(),
+        "top-secret".into(),
+    );
+    let text = format!("{configured:?}");
     assert!(text.contains("client-id"), "{text}");
     assert!(!text.contains("top-secret"), "{text}");
 }

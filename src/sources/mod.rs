@@ -162,13 +162,16 @@ pub fn registry(config: &Config, credentials: &Credentials) -> Vec<Box<dyn Sourc
 pub fn source_statuses(sources: &[Box<dyn Source>]) -> Vec<SourceStatus> {
     sources
         .iter()
-        .map(|source| SourceStatus {
-            id: source.id(),
-            capabilities: source.capabilities(),
-            auth: source.auth_state(),
-            detail: source
-                .detail()
-                .or_else(|| credential_hint(source.id(), source.auth_state())),
+        .map(|source| {
+            let auth = source.auth_state();
+            SourceStatus {
+                id: source.id(),
+                capabilities: source.capabilities(),
+                auth,
+                detail: source
+                    .detail()
+                    .or_else(|| credential_hint(source.id(), auth)),
+            }
         })
         .collect()
 }

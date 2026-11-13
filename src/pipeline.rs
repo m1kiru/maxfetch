@@ -28,7 +28,7 @@ use crate::matching::{ReleaseGroup, group_releases, match_key};
 use crate::model::{Candidate, Container, Quality, Release, SourceId};
 use crate::probe::{ProbeResult, probe};
 use crate::quality::{compare_quality, rank_candidates};
-use crate::sources::{Query, Source, SourceStatus, enabled_in};
+use crate::sources::{Query, Source, SourceStatus, enabled_in, skip_reason};
 use crate::tags::{TagMeta, write_tags};
 
 /// Search, candidate ranking and verified downloading over the enabled sources.
@@ -124,7 +124,7 @@ impl Pipeline {
         let sources: Vec<&dyn Source> = self
             .enabled_sources()
             .into_iter()
-            .filter(|source| match crate::sources::skip_reason(*source) {
+            .filter(|source| match skip_reason(*source) {
                 Some(reason) => {
                     tracing::warn!(%reason, "source skipped");
                     false
