@@ -7,6 +7,7 @@
 //! single place where `config.sources.enabled` is turned into a list of
 //! ready-to-use ids.
 
+pub mod bandcamp;
 pub mod soulseek;
 pub mod spotify;
 pub mod youtube;
