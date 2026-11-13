@@ -4,20 +4,25 @@
 //! Everything here is stateless: a scraper that extracts the public
 //! `client_id` from the web page bundles the way `yt-dlp` does (§8.9), a
 //! credentials-file cache around it, and a thin typed layer over the
-//! `GET /users/{id}` profile endpoint. No retry logic and no 401/403
-//! re-scraping lives here; the `SoundCloudSource` itself arrives in Task 8
-//! and wraps these helpers with `http_client` and its retry policy.
+//! `GET /users/{id}` profile endpoint. No retry logic lives here either: the
+//! `SoundCloudSource` at the bottom of this module wraps these helpers with
+//! `http_client` and its own 401/403 re-scrape retry policy.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::Context;
+use async_trait::async_trait;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::Mutex;
 
-use crate::config::{Credentials, SoundCloudCredentials};
-use crate::model::{Container, Quality, Release, SourceId};
+use crate::config::{Config, Credentials, SoundCloudCredentials};
+use crate::fetch::{ProgressSink, http_client};
+use crate::model::{Candidate, Container, Locator, Quality, Release, SourceId};
+use crate::sources::{AuthState, Capabilities, Query, QueryItem, Source};
+use crate::youtube::run_json;
 
 /// The one `client_id` pattern shared by the scraper and its documentation.
 pub const CLIENT_ID_REGEX: &str = r#"client_id\s*:\s*"([0-9a-zA-Z]{32})""#;
@@ -548,5 +553,376 @@ pub fn format_of(audio_format: &AudioFormat) -> SoundCloudFormat {
         // bitrate is an open `u32`.
         AudioFormat::LossyAac { .. } => SoundCloudFormat::Aac96,
         AudioFormat::ProgressiveOriginal { .. } => SoundCloudFormat::Original,
+    }
+}
+
+// ─── The source (Task 8) ─────────────────────────────────────────────────────
+
+/// What a user typed for SoundCloud: a bare track id, a permalink-style URL
+/// or free-form search text.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SoundCloudInput {
+    Id(u64),
+    Url(String),
+    Text(String),
+}
+
+/// Classifies `s`: an all-digit string is a bare [`SoundCloudInput::Id`],
+/// something starting with `http` or mentioning `soundcloud.com` is a
+/// [`SoundCloudInput::Url`], everything else is free-form
+/// [`SoundCloudInput::Text`].
+pub fn classify_input(s: &str) -> SoundCloudInput {
+    if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) {
+        return SoundCloudInput::Id(s.parse().unwrap());
+    }
+    if s.starts_with("http") || s.contains("soundcloud.com") {
+        return SoundCloudInput::Url(s.to_string());
+    }
+    SoundCloudInput::Text(s.to_string())
+}
+
+/// The `yt-dlp` search argument for `query`: the `scsearch` prefix with the
+/// result limit, as `yt-dlp` expects it.
+pub fn search_arg(query: &str, limit: u32) -> String {
+    format!("scsearch{limit}:{query}")
+}
+
+/// Reads track ids out of a `yt-dlp -J` body: the top-level `id` first, then
+/// every `entries[].id` in document order. Ids arrive as strings; values that
+/// do not parse as `u64` (for example the `scsearch10:...` search id) are
+/// skipped silently. A missing `entries` is fine: that is the single-track
+/// shape.
+pub fn parse_ytdlp_ids(json: &str) -> Vec<u64> {
+    let Ok(value) = serde_json::from_str::<Value>(json) else {
+        return Vec::new();
+    };
+    let mut ids = Vec::new();
+    if let Some(id) = value
+        .get("id")
+        .and_then(Value::as_str)
+        .and_then(|id| id.parse().ok())
+    {
+        ids.push(id);
+    }
+    if let Some(entries) = value.get("entries").and_then(Value::as_array) {
+        for entry in entries {
+            if let Some(id) = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| id.parse().ok())
+            {
+                ids.push(id);
+            }
+        }
+    }
+    ids
+}
+
+/// The live SoundCloud source: a scraped, credentials-cached `client_id` with
+/// exactly one re-scrape retry on 401/403, the `GET /tracks/{id}` catalog and
+/// `yt-dlp` for everything the plain API cannot answer (search, sets,
+/// downloads).
+pub struct SoundCloudSource {
+    endpoints: SoundCloudEndpoints,
+    client: reqwest::Client,
+    credentials_dir: PathBuf,
+    yt_dlp_path: String,
+    oauth_token: String,
+    /// The §8.9 profile of the last resolved track, kept for enrichment;
+    /// `std::sync::Mutex` is not `Clone`, so the tokio one guards it.
+    profile: Mutex<Option<SoundCloudUser>>,
+}
+
+// A derived `Clone` is impossible: unlike the brief assumed, neither
+// `std::sync::Mutex` nor `tokio::sync::Mutex` implements it, and the tokio
+// lock cannot be taken from the synchronous `clone`. A clone therefore starts
+// with an empty profile cache and shares nothing but immutable config.
+impl Clone for SoundCloudSource {
+    fn clone(&self) -> Self {
+        SoundCloudSource {
+            endpoints: self.endpoints.clone(),
+            client: self.client.clone(),
+            credentials_dir: self.credentials_dir.clone(),
+            yt_dlp_path: self.yt_dlp_path.clone(),
+            oauth_token: self.oauth_token.clone(),
+            profile: Mutex::new(None),
+        }
+    }
+}
+
+impl SoundCloudSource {
+    /// The production source: the real SoundCloud hosts, the default
+    /// credentials cache and the configured `yt-dlp`.
+    ///
+    /// No I/O happens here: the `client_id` is scraped on first use.
+    pub fn new(config: &Config, credentials: &Credentials) -> SoundCloudSource {
+        let client = match http_client(config.download.timeout_sec) {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!("не удалось создать HTTP-клиент SoundCloud: {error}");
+                reqwest::Client::new()
+            }
+        };
+        SoundCloudSource {
+            endpoints: SoundCloudEndpoints::production(),
+            client,
+            credentials_dir: crate::config::config_dir(),
+            yt_dlp_path: config.youtube.yt_dlp_path.clone(),
+            oauth_token: credentials
+                .soundcloud
+                .as_ref()
+                .map(|section| section.oauth_token.clone())
+                .unwrap_or_default(),
+            profile: Mutex::new(None),
+        }
+    }
+
+    /// A source pointed at `api_base` — all three hosts collapsed onto it, as
+    /// a loopback test server requires — with an explicit credentials cache
+    /// root and `yt_dlp_path`, and without an OAuth token.
+    pub fn with_api_base(
+        api_base: &str,
+        credentials_dir: &Path,
+        yt_dlp_path: &str,
+    ) -> SoundCloudSource {
+        let base = api_base.trim_end_matches('/');
+        SoundCloudSource {
+            endpoints: SoundCloudEndpoints {
+                web_base: base.to_string(),
+                api_base: base.to_string(),
+                script_base: base.to_string(),
+            },
+            client: reqwest::Client::new(),
+            credentials_dir: credentials_dir.to_path_buf(),
+            yt_dlp_path: yt_dlp_path.to_string(),
+            oauth_token: String::new(),
+            profile: Mutex::new(None),
+        }
+    }
+
+    /// One `GET {api_base}{path}?client_id=...` call: the only place this
+    /// source talks to the API.
+    ///
+    /// The `client_id` comes from [`ensure_client_id`] (cache first, scrape
+    /// otherwise). A 401/403 triggers one fresh scrape, stores the new id and
+    /// retries the request exactly once; a second rejection is a hard error.
+    /// Other non-2xx statuses fail with the status in the message.
+    pub async fn api_get(&self, path: &str) -> anyhow::Result<String> {
+        let client_id =
+            ensure_client_id(&self.credentials_dir, &self.client, &self.endpoints).await?;
+        let url = self.api_url(path, &client_id);
+        let first = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("не удалось скачать {url}"))?;
+        if !matches!(
+            first.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            return body_text(first, &url).await;
+        }
+        let fresh = scrape_client_id(&self.client, &self.endpoints).await?;
+        store_client_id(&self.credentials_dir, &fresh)?;
+        let url = self.api_url(path, &fresh);
+        let retried = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("не удалось скачать {url}"))?;
+        if matches!(
+            retried.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            anyhow::bail!("soundcloud: client_id rejected after a re-scrape");
+        }
+        body_text(retried, &url).await
+    }
+
+    /// The URL of one API call: `{api_base}{path}?client_id={id}`, or
+    /// `&client_id=` when `path` already carries a query.
+    fn api_url(&self, path: &str, client_id: &str) -> String {
+        let separator = if path.contains('?') { '&' } else { '?' };
+        format!(
+            "{}{path}{separator}client_id={client_id}",
+            self.endpoints.api_base
+        )
+    }
+
+    /// One `GET /tracks/{id}` release plus the §8.9 profile enrichment.
+    ///
+    /// A profile failure only logs and never fails the resolve: it is
+    /// enrichment, not the payload.
+    async fn fetch_track(&self, id: &str) -> anyhow::Result<Release> {
+        let track = parse_track(&self.api_get(&format!("/tracks/{id}")).await?)?;
+        let release = track.release_from_track();
+        let profile = self
+            .api_get(&format!("/users/{}", track.user_id))
+            .await
+            .and_then(|body| parse_user(&body));
+        match profile {
+            Ok(user) => *self.profile.lock().await = Some(user),
+            Err(error) => {
+                tracing::debug!("soundcloud: профиль {} недоступен: {error}", track.user_id)
+            }
+        }
+        Ok(release)
+    }
+
+    /// Resolves every id `yt-dlp` reports for `target` (a URL, a set id or a
+    /// `scsearch` argument), one `GET /tracks/{id}` each.
+    ///
+    /// A broken or missing `yt-dlp` only logs and yields an empty list: it
+    /// must not abort the run.
+    async fn fetch_ytdlp_ids(&self, target: &str) -> anyhow::Result<Vec<Release>> {
+        let json = match run_json(&self.yt_dlp_path, &["-J", "--flat-playlist", target]) {
+            Ok(json) => json,
+            Err(error) => {
+                tracing::warn!("soundcloud: yt-dlp не смог разобрать {target}: {error}");
+                return Ok(Vec::new());
+            }
+        };
+        let mut releases = Vec::new();
+        for id in parse_ytdlp_ids(&json.to_string()) {
+            releases.push(self.fetch_track(&id.to_string()).await?);
+        }
+        Ok(releases)
+    }
+
+    /// The one routing `search` and `resolve` delegate to: explicit items
+    /// first (tracks through the API, sets through `yt-dlp`), then a URL,
+    /// then free text as a `scsearch`.
+    async fn fetch_query(&self, q: &Query) -> anyhow::Result<Vec<Release>> {
+        let mut releases = Vec::new();
+        for item in &q.items {
+            match item {
+                QueryItem::Track { id, .. } => releases.push(self.fetch_track(id).await?),
+                QueryItem::Album { id, .. } | QueryItem::Playlist { id, .. } => {
+                    releases.extend(self.fetch_ytdlp_ids(id).await?);
+                }
+            }
+        }
+        if let Some(url) = &q.url {
+            releases.extend(self.fetch_ytdlp_ids(url).await?);
+        }
+        if let Some(text) = &q.text {
+            releases.extend(self.fetch_ytdlp_ids(&search_arg(text, 10)).await?);
+        }
+        Ok(releases)
+    }
+}
+
+/// Reads the body of a finished response; non-2xx becomes a Russian error in
+/// the style of `get_user`.
+async fn body_text(response: reqwest::Response, url: &str) -> anyhow::Result<String> {
+    let status = response.status();
+    if !status.is_success() {
+        anyhow::bail!("{url} ответил ошибкой {status}");
+    }
+    response
+        .text()
+        .await
+        .with_context(|| format!("не удалось прочитать тело {url}"))
+}
+
+#[async_trait]
+impl Source for SoundCloudSource {
+    fn id(&self) -> SourceId {
+        SourceId::SoundCloud
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            audio: true,
+            metadata_only: false,
+            // Lossless originals sit behind OAuth-protected downloads; an
+            // anonymous client only ever sees the lossy AAC transcodes.
+            lossless: !self.oauth_token.is_empty(),
+            needs_auth: false,
+        }
+    }
+
+    fn auth_state(&self) -> AuthState {
+        AuthState::NotNeeded
+    }
+
+    async fn search(&self, q: &Query) -> anyhow::Result<Vec<Release>> {
+        self.fetch_query(q).await
+    }
+
+    async fn resolve(&self, q: &Query) -> anyhow::Result<Vec<Release>> {
+        self.fetch_query(q).await
+    }
+
+    async fn candidates(&self, release: &Release) -> anyhow::Result<Vec<Candidate>> {
+        let track_id = release.source_item_id.clone();
+        let track = parse_track(&self.api_get(&format!("/tracks/{track_id}")).await?)?;
+        let picked = AudioFormat::pick(&track.transcodings).ok_or_else(|| {
+            anyhow::anyhow!("у трека SoundCloud {track_id} нет доступных потоков")
+        })?;
+        Ok(vec![Candidate {
+            source: SourceId::SoundCloud,
+            release: release.clone(),
+            quality: picked.quality(),
+            // SoundCloud does not advertise a size before the transfer.
+            size_bytes: None,
+            locator: Locator::SoundCloud {
+                track_id,
+                format: format_of(&picked),
+            },
+        }])
+    }
+
+    async fn download(
+        &self,
+        candidate: &Candidate,
+        dest: &Path,
+        sink: &dyn ProgressSink,
+    ) -> anyhow::Result<()> {
+        let Locator::SoundCloud { track_id, format } = &candidate.locator else {
+            anyhow::bail!("soundcloud: локатор не принадлежит этому источнику");
+        };
+        // The candidate carries only the locator format (WD7); `M3u8` is the
+        // stage 2 slot and is never produced here.
+        let preset = match format {
+            SoundCloudFormat::Aac160 => "hls_aac_160k",
+            SoundCloudFormat::Aac96 => "hls_aac_96k",
+            SoundCloudFormat::Original => "bestaudio",
+            SoundCloudFormat::M3u8 => anyhow::bail!("soundcloud: HLS-плейлист появится в этапе 2"),
+        };
+        // The permalink is not part of the locator (WD8): refetch the track.
+        let track = parse_track(&self.api_get(&format!("/tracks/{track_id}")).await?)?;
+        let dest_str = dest.to_string_lossy().into_owned();
+        let output = tokio::process::Command::new(&self.yt_dlp_path)
+            .args([
+                "-f",
+                preset,
+                "-o",
+                &dest_str,
+                "--no-playlist",
+                &track.permalink_url,
+            ])
+            .output()
+            .await
+            .with_context(|| format!("не удалось запустить yt-dlp: {}", self.yt_dlp_path))?;
+        if !output.status.success() {
+            let tail: String = String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .rev()
+                .take(500)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            anyhow::bail!(
+                "yt-dlp завершился с кодом {}: {}",
+                output.status,
+                tail.trim()
+            );
+        }
+        sink.on_finished(std::fs::metadata(dest)?.len());
+        Ok(())
     }
 }
