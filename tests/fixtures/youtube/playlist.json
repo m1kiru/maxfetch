@@ -1,0 +1,5 @@
+{"_type":"playlist","id":"PL1","title":"Mix","entries":[
+  {"_type":"url","id":"abc123","title":"Daft Punk - Get Lucky","duration":369.0},
+  {"_type":"url","id":"def456","title":"Daft Punk - One More Time","duration":320.0},
+  {"_type":"url","title":"no id, must be skipped"}
+]}

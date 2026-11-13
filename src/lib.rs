@@ -14,3 +14,4 @@ pub mod quality;
 pub mod sources;
 pub mod tags;
 pub mod tui;
+pub mod youtube;

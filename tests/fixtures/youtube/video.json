@@ -1,0 +1,4 @@
+{"_type":"video","id":"abc123","title":"Daft Punk - Get Lucky (Official Video)","track":"Get Lucky","artist":"Daft Punk","album":"Random Access Memories","duration":369.0,"uploader":"Daft Punk","channel":"Daft Punk","formats":[
+  {"format_id":"251","ext":"webm","acodec":"opus","abr":160.0,"asr":48000},
+  {"format_id":"140","ext":"m4a","acodec":"mp4a.40.2","abr":128.0,"asr":44100}
+]}
