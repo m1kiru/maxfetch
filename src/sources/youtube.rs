@@ -82,6 +82,11 @@ impl Source for YoutubeSource {
         AuthState::NotNeeded
     }
 
+    /// Reports an unusable `yt-dlp`, configured path included.
+    fn detail(&self) -> Option<String> {
+        crate::youtube::binary_status(&self.yt_dlp_path)
+    }
+
     async fn search(&self, q: &Query) -> anyhow::Result<Vec<Release>> {
         let url = q
             .url

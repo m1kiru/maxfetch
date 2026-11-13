@@ -204,6 +204,50 @@ impl Source for Counting {
     }
 }
 
+/// A source that reports missing credentials and counts whether it was queried.
+struct Unauthorized {
+    inner: Fake,
+    searches: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Source for Unauthorized {
+    fn id(&self) -> SourceId {
+        self.inner.id()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn auth_state(&self) -> AuthState {
+        AuthState::Missing
+    }
+
+    async fn search(&self, q: &Query) -> anyhow::Result<Vec<Release>> {
+        self.searches.fetch_add(1, Ordering::SeqCst);
+        self.inner.search(q).await
+    }
+
+    async fn resolve(&self, q: &Query) -> anyhow::Result<Vec<Release>> {
+        self.searches.fetch_add(1, Ordering::SeqCst);
+        self.inner.resolve(q).await
+    }
+
+    async fn candidates(&self, release: &Release) -> anyhow::Result<Vec<Candidate>> {
+        self.inner.candidates(release).await
+    }
+
+    async fn download(
+        &self,
+        candidate: &Candidate,
+        dest: &Path,
+        sink: &dyn ProgressSink,
+    ) -> anyhow::Result<()> {
+        self.inner.download(candidate, dest, sink).await
+    }
+}
+
 fn text_query(text: &str) -> Query {
     Query {
         text: Some(text.to_string()),
@@ -426,8 +470,10 @@ async fn source_statuses_reports_one_status_per_source() {
     assert!(empty.source_statuses().is_empty());
 }
 
+// An empty `config.sources.enabled` means "everything enabled", so the single
+// registered fake is queried instead of being skipped.
 #[tokio::test]
-async fn an_empty_enabled_list_queries_nothing() {
+async fn an_empty_enabled_list_queries_every_source() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = cfg_in(dir.path());
     cfg.sources.enabled = Vec::new();
@@ -442,6 +488,38 @@ async fn an_empty_enabled_list_queries_nothing() {
         searches: searches.clone(),
     };
     let pipeline = Pipeline::new(cfg, Db::open_in_memory().unwrap(), vec![Box::new(counting)]);
+
+    let groups = pipeline
+        .search(&text_query("daft punk get lucky"))
+        .await
+        .unwrap();
+
+    assert_eq!(groups.len(), 1);
+    assert!(searches.load(Ordering::SeqCst) >= 1);
+}
+
+// A source that reports `AuthState::Missing` is never queried: the run would
+// otherwise try to log in with absent credentials, which aborts on runtimes
+// that cannot block.
+#[tokio::test]
+async fn a_source_without_credentials_is_not_queried() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = cfg_in(dir.path());
+    let searches = Arc::new(AtomicUsize::new(0));
+    let unauthorized = Unauthorized {
+        inner: Fake::flac(
+            SourceId::Soulseek,
+            vec![rel(SourceId::Soulseek)],
+            quality(16, 44100),
+            "sine_44100_s16.flac",
+        ),
+        searches: searches.clone(),
+    };
+    let pipeline = Pipeline::new(
+        cfg,
+        Db::open_in_memory().unwrap(),
+        vec![Box::new(unauthorized)],
+    );
 
     let groups = pipeline
         .search(&text_query("daft punk get lucky"))

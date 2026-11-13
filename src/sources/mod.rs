@@ -3,21 +3,26 @@
 //! This module defines what a source is: its [`Capabilities`], its
 //! [`AuthState`], the [`Query`] it can be asked, and the [`Source`] trait it
 //! implements. [`registry`] answers "which sources exist in this build" and
-//! stays empty until the stage plans register their implementations;
-//! [`enabled_in`] is the single place where `config.sources.enabled` is turned
-//! into a list of ready-to-use ids.
+//! registers the implementations this build carries; [`enabled_in`] is the
+//! single place where `config.sources.enabled` is turned into a list of
+//! ready-to-use ids.
 
 pub mod soulseek;
 pub mod spotify;
 pub mod youtube;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::config::{Config, Credentials};
 use crate::fetch::ProgressSink;
 use crate::model::{Candidate, Release, SourceId};
+
+use soulseek::SoulseekSource;
+use spotify::{RspotifyApi, SpotifyApi, SpotifySource, UnconfiguredApi};
+use youtube::YoutubeSource;
 
 /// What a source can do, independent of its current configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +92,14 @@ pub trait Source: Send + Sync {
     /// Current authorisation state; must not touch the network.
     fn auth_state(&self) -> AuthState;
 
+    /// Optional diagnosis to show next to the status; must not touch the network.
+    ///
+    /// Defaults to "nothing to add"; a source overrides it when the message
+    /// depends on its own configuration (for example a configured binary path).
+    fn detail(&self) -> Option<String> {
+        None
+    }
+
     /// Searches by free text, URL or explicit items.
     async fn search(&self, q: &Query) -> anyhow::Result<Vec<Release>>;
 
@@ -111,19 +124,98 @@ pub trait Source: Send + Sync {
 /// Returns every source compiled into this build.
 ///
 /// The registry never filters by configuration: it answers "what exists",
-/// not "what is enabled". Selection happens in [`enabled_in`].
-pub fn registry(_config: &Config, _credentials: &Credentials) -> Vec<Box<dyn Source>> {
-    // Stage plans register their sources here, one `Box::new(...)` per source.
-    // Do not filter by `config.sources.enabled`: selection happens in `enabled_in`.
-    Vec::new()
+/// not "what is enabled". Selection happens in [`enabled_in`]. The order is
+/// fixed — Soulseek, YouTube, Spotify — so the CLI and the TUI render a stable
+/// list. No constructor opens a socket or reads `credentials.toml`.
+pub fn registry(config: &Config, credentials: &Credentials) -> Vec<Box<dyn Source>> {
+    let mut sources: Vec<Box<dyn Source>> = Vec::with_capacity(3);
+
+    sources.push(Box::new(SoulseekSource::new(
+        credentials.soulseek.clone().unwrap_or_default(),
+        config.download.clone(),
+    )));
+    sources.push(Box::new(YoutubeSource::new(&config.youtube, &config.media)));
+
+    let api: Arc<dyn SpotifyApi> = match &credentials.spotify {
+        Some(spotify) if !spotify.client_id.is_empty() && !spotify.client_secret.is_empty() => {
+            Arc::new(RspotifyApi::new(
+                spotify.client_id.clone(),
+                spotify.client_secret.clone(),
+            ))
+        }
+        _ => Arc::new(UnconfiguredApi),
+    };
+    let (client_id, client_secret) = match &credentials.spotify {
+        Some(spotify) => (spotify.client_id.clone(), spotify.client_secret.clone()),
+        None => (String::new(), String::new()),
+    };
+    sources.push(Box::new(SpotifySource::new(api, client_id, client_secret)));
+
+    sources
+}
+
+/// One status per source, with the Russian diagnosis in `detail`.
+///
+/// Nothing here touches the network. `detail` comes from the source itself when
+/// it has something configured to report (the `yt-dlp` path); otherwise a
+/// [`AuthState::Missing`] source gets the hint about the credentials section.
+pub fn source_statuses(sources: &[Box<dyn Source>]) -> Vec<SourceStatus> {
+    sources
+        .iter()
+        .map(|source| SourceStatus {
+            id: source.id(),
+            capabilities: source.capabilities(),
+            auth: source.auth_state(),
+            detail: source
+                .detail()
+                .or_else(|| credential_hint(source.id(), source.auth_state())),
+        })
+        .collect()
+}
+
+/// Points a source without credentials at the section it needs.
+///
+/// Derived from [`SourceId`] and [`AuthState`] alone, so it needs no `Config`.
+fn credential_hint(id: SourceId, auth: AuthState) -> Option<String> {
+    if auth != AuthState::Missing {
+        return None;
+    }
+    match id {
+        SourceId::Soulseek => Some(
+            "нет данных для входа в Soulseek: секция [soulseek] в credentials.toml".to_string(),
+        ),
+        SourceId::Spotify => Some(
+            "нет client_id/client_secret Spotify: секция [spotify] в credentials.toml".to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// Why `source` is skipped in this run; `None` when it can be used.
+pub fn skip_reason(source: &dyn Source) -> Option<String> {
+    match source.auth_state() {
+        AuthState::Missing => Some(format!(
+            "источник {} пропущен: нет авторизации",
+            source.id().as_str()
+        )),
+        AuthState::Expired => Some(format!(
+            "источник {} пропущен: ключи протухли",
+            source.id().as_str()
+        )),
+        AuthState::Ok | AuthState::NotNeeded => None,
+    }
 }
 
 /// Keeps the ids that `config.sources.enabled` lists, in the order of `ids`.
 ///
 /// This is the only selection point; pipeline, TUI and CLI must call it instead
-/// of comparing source names themselves. An empty configured list selects
-/// nothing.
+/// of comparing source names themselves. An empty configured list keeps every
+/// id, because "no list at all" means "everything enabled".
 pub fn enabled_in(ids: &[SourceId], config: &Config) -> Vec<SourceId> {
+    if config.sources.enabled.is_empty() {
+        return ids.to_vec();
+    }
+
     for name in &config.sources.enabled {
         if SourceId::from_str(name).is_none() {
             tracing::warn!(name = %name, "unknown source name in config.sources.enabled");

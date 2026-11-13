@@ -2,16 +2,10 @@ use std::path::Path;
 
 use async_trait::async_trait;
 
-use maxfetch::config::{Config, Credentials};
+use maxfetch::config::Config;
 use maxfetch::fetch::ProgressSink;
 use maxfetch::model::{Candidate, Release, SourceId};
-use maxfetch::sources::{AuthState, Capabilities, Query, Source, enabled_in, is_enabled, registry};
-
-#[test]
-fn registry_is_empty_before_sources_are_added() {
-    let sources = registry(&Config::default(), &Credentials::default());
-    assert!(sources.is_empty());
-}
+use maxfetch::sources::{AuthState, Capabilities, Query, Source, enabled_in, is_enabled};
 
 #[test]
 fn enabled_in_follows_the_configured_list() {

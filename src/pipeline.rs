@@ -121,7 +121,17 @@ impl Pipeline {
         }
 
         let by_text = text.is_some();
-        let sources = self.enabled_sources();
+        let sources: Vec<&dyn Source> = self
+            .enabled_sources()
+            .into_iter()
+            .filter(|source| match crate::sources::skip_reason(*source) {
+                Some(reason) => {
+                    tracing::warn!(%reason, "source skipped");
+                    false
+                }
+                None => true,
+            })
+            .collect();
         let results = futures_util::future::join_all(sources.iter().map(|source| async move {
             let id = source.id();
             let outcome = if by_text {

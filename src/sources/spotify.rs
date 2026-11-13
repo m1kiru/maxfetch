@@ -146,11 +146,22 @@ impl SpotifyApi for UnconfiguredApi {
 }
 
 /// Spotify as a metadata-only catalogue; see [`Source`] for its behaviour.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SpotifySource {
     api: Arc<dyn SpotifyApi>,
     client_id: String,
     client_secret: String,
+}
+
+/// Masks `client_secret` so a logged or formatted source never leaks it.
+impl std::fmt::Debug for SpotifySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpotifySource")
+            .field("api", &self.api)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"***")
+            .finish()
+    }
 }
 
 impl SpotifySource {
