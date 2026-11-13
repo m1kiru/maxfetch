@@ -10,7 +10,7 @@ use chrono::Datelike;
 use regex::Regex;
 use serde_json::{Map, Value};
 
-use crate::model::{Release, SourceId};
+use crate::model::{Container, Quality, Release, SourceId};
 
 /// Which kind of tralbum page a Bandcamp id pair describes.
 ///
@@ -409,4 +409,152 @@ fn string_field(object: &Map<String, Value>, key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned()
+}
+
+/// The promo block carried by a tralbum page's `data-tralbum` attribute.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DataTralbum {
+    pub free_download_page: Option<String>,
+}
+
+/// Reads the promo page from the `data-tralbum` attribute of a tralbum page.
+///
+/// The attribute value is HTML-escaped JSON: `&quot;` and `&#39;` are
+/// unescaped first and `&amp;` last, so `&amp;quot;` cannot collapse into a
+/// quote. A page without the attribute, a value without a closing quote or
+/// invalid JSON all yield `None`; a blob without `freeDownloadPage` yields
+/// `Some` with `free_download_page: None`, so callers can tell "no blob" from
+/// "blob without a promo".
+pub fn parse_data_tralbum(html: &str) -> Option<DataTralbum> {
+    const MARKER: &str = "data-tralbum=\"";
+    let start = html.find(MARKER)? + MARKER.len();
+    let rest = &html[start..];
+    let end = rest.find('"')?;
+    let raw = &rest[..end];
+    let unescaped = raw
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
+    let value: Value = serde_json::from_str(&unescaped).ok()?;
+    Some(DataTralbum {
+        free_download_page: value
+            .get("freeDownloadPage")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+/// Rewrites a promo `/download` URL into its `/statdownload` form with a nonce.
+///
+/// The `/download` path segment is replaced by `/statdownload`, the original
+/// query string is kept verbatim and `&.rand=<nonce>` is appended. The
+/// separator comes from the source URL: `?` when it carries no query and `&`
+/// when it does, so the result is always a parseable URL and never
+/// `.../statdownload&.rand=N` without a `?`. `None` when the path has no
+/// `/download` segment.
+pub fn statdownload_url(download_url: &str, nonce: u64) -> Option<String> {
+    let (path, query) = match download_url.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (download_url, None),
+    };
+    let path = if let Some(prefix) = path.strip_suffix("/download") {
+        format!("{prefix}/statdownload")
+    } else if path.contains("/download/") {
+        path.replacen("/download/", "/statdownload/", 1)
+    } else {
+        return None;
+    };
+    Some(match query {
+        Some(query) => format!("{path}?{query}&.rand={nonce}"),
+        None => format!("{path}?&.rand={nonce}"),
+    })
+}
+
+/// The `var _statDL_result = {...}` assignment answered by `/statdownload`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StatDownloadResult {
+    pub retry_url: Option<String>,
+    pub err_type: Option<String>,
+}
+
+/// Parses the JSON object assigned to `_statDL_result`.
+///
+/// Bandcamp answers the assignment with a trailing `;`, so the object is read
+/// with a streaming deserializer that stops after the first value; the tail is
+/// ignored. A body without the marker, an invalid object, or a non-object
+/// value all yield `None`.
+pub fn parse_statdownload_result(body: &str) -> Option<StatDownloadResult> {
+    const MARKER: &str = "var _statDL_result = ";
+    let start = body.find(MARKER)? + MARKER.len();
+    let rest = body[start..].trim_start();
+    let value = serde_json::Deserializer::from_str(rest)
+        .into_iter::<Value>()
+        .next()?
+        .ok()?;
+    let object = value.as_object()?;
+    Some(StatDownloadResult {
+        retry_url: object
+            .get("retry_url")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        err_type: object
+            .get("errortype")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+/// Whether a `/statdownload` answer is Bandcamp's expired-download body.
+pub fn is_expired_download(status: u16, body: &str) -> bool {
+    status == 403 && body.trim() == "Download Expired"
+}
+
+/// The `enc` value from a retry URL, `"flac"` when the parameter is absent.
+///
+/// This is the encoding the promo archive really contains: it is chosen by
+/// Bandcamp, not by us. The `enc` token is plain ASCII (`flac`, `mp3-320`,
+/// `aac-hi`), so no percent-decoding is applied.
+pub fn retry_encoding(retry_url: &str) -> String {
+    let Some((_, query)) = retry_url.split_once('?') else {
+        return "flac".to_owned();
+    };
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("enc=") {
+            return value.to_owned();
+        }
+    }
+    "flac".to_owned()
+}
+
+/// The eight Bandcamp free-download format keys, lossless first.
+pub const FREE_DOWNLOAD_FORMATS: [&str; 8] = [
+    "flac", "alac", "wav", "vorbis", "mp3-v0", "mp3-320", "aac-hi", "mp3-128",
+];
+
+/// Maps a Bandcamp free-download format key to its fixed [`Quality`].
+///
+/// This is the single place that maps the keys. `bit_depth` and `sample_rate`
+/// stay `None` because only the probe may fill measured values, and `mp3-v0`
+/// is VBR and therefore carries no bitrate. `lossless` is derived from the
+/// container so the table cannot drift from [`Container::is_lossless`]. Keys
+/// outside the table (`zip`, `aiff`) yield `None`.
+pub fn format_quality(fmt: &str) -> Option<Quality> {
+    let (container, bitrate_kbps) = match fmt {
+        "flac" => (Container::Flac, None),
+        "alac" => (Container::Alac, None),
+        "wav" => (Container::Wav, None),
+        "vorbis" => (Container::Opus, None),
+        "mp3-v0" => (Container::Mp3, None),
+        "mp3-320" => (Container::Mp3, Some(320)),
+        "aac-hi" => (Container::M4aAac, None),
+        "mp3-128" => (Container::Mp3, Some(128)),
+        _ => return None,
+    };
+    Some(Quality {
+        lossless: container.is_lossless(),
+        container,
+        bit_depth: None,
+        sample_rate: None,
+        bitrate_kbps,
+    })
 }

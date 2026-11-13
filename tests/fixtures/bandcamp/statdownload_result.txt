@@ -1,0 +1,1 @@
+var _statDL_result = {"result":"err","retry_url":"https://nightwave.bandcamp.com/download/album?enc=flac&fsig=abc123&id=2814","errortype":"ExpiredFreeDownloadError"};
