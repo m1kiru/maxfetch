@@ -8,6 +8,7 @@
 //! ready-to-use ids.
 
 pub mod bandcamp;
+pub mod qobuz;
 pub mod soulseek;
 pub mod soundcloud;
 pub mod spotify;
